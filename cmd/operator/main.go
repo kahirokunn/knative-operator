@@ -17,6 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"flag"
+
+	"knative.dev/operator/pkg/reconciler/common"
 	"knative.dev/operator/pkg/reconciler/knativeeventing"
 	"knative.dev/operator/pkg/reconciler/knativeserving"
 	kubefilteredfactory "knative.dev/pkg/client/injection/kube/informers/factory/filtered"
@@ -25,6 +28,11 @@ import (
 )
 
 func main() {
+	flag.StringVar(&common.CredentialProvidersConfigPath,
+		"credential-providers-config", "",
+		"Path to the credential providers config file for "+
+			"Cluster Inventory API multi-cluster support")
+
 	ctx := signals.NewContext()
 	ctx = kubefilteredfactory.WithSelectors(ctx,
 		knativeserving.Selector,

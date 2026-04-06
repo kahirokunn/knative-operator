@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
@@ -51,6 +52,9 @@ type Reconciler struct {
 	manifest mf.Manifest
 	// Platform-specific behavior to affect the transform
 	extension common.Extension
+	// localConfig is the rest.Config for the local (management) cluster,
+	// used to resolve ClusterProfile references for multi-cluster deployment.
+	localConfig *rest.Config
 }
 
 // Check that our Reconciler implements controller.Reconciler
@@ -89,6 +93,15 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, original *v1beta1.Knative
 
 	if manifest == nil {
 		return nil
+	}
+
+	// Resolve target cluster for multi-cluster finalization.
+	// If this fails, we return the error so the finalizer retries.
+	// To force-delete, remove the finalizer manually.
+	if err := common.ResolveTargetClusterForManifest(ctx, r.localConfig, manifest, original); err != nil {
+		logger.Errorf("Failed to resolve target cluster for finalization: %v. "+
+			"Remote resources may need manual cleanup.", err)
+		return err
 	}
 
 	// For optional resources like cert-manager's Certificates and Issuers, we don't want to fail
@@ -134,6 +147,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ke *v1beta1.KnativeEvent
 		return err
 	}
 	stages := common.Stages{
+		common.ResolveTargetCluster(r.localConfig),
 		common.AppendTarget,
 		source.AppendTargetSources,
 		common.AppendAdditionalManifests,

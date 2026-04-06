@@ -45,9 +45,18 @@ func transformers(ctx context.Context, obj base.KComponent) []mf.Transformer {
 
 func injectOwner(owner mf.Owner) mf.Transformer {
 	return func(u *unstructured.Unstructured) error {
-		if u.GetNamespace() != "" {
-			u.SetOwnerReferences([]v1.OwnerReference{*v1.NewControllerRef(owner, owner.GroupVersionKind())})
+		if u.GetNamespace() == "" {
+			return nil
 		}
+		// When deploying to a remote cluster, the owner CR does not exist
+		// there. Setting an OwnerReference would be invalid and break
+		// garbage collection. Finalization handles cleanup instead.
+		if kc, ok := owner.(base.KComponent); ok {
+			if kc.GetSpec().GetClusterProfileRef() != nil {
+				return nil
+			}
+		}
+		u.SetOwnerReferences([]v1.OwnerReference{*v1.NewControllerRef(owner, owner.GroupVersionKind())})
 		return nil
 	}
 }

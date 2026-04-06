@@ -23,6 +23,7 @@ import (
 	mf "github.com/manifestival/manifestival"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
@@ -51,6 +52,9 @@ type Reconciler struct {
 	manifest mf.Manifest
 	// Platform-specific behavior to affect the transform
 	extension common.Extension
+	// localConfig is the rest.Config for the local (management) cluster,
+	// used to resolve ClusterProfile references for multi-cluster deployment.
+	localConfig *rest.Config
 }
 
 // Check that our Reconciler implements controller.Reconciler
@@ -92,6 +96,15 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, original *v1beta1.Knative
 		return nil
 	}
 
+	// Resolve target cluster for multi-cluster finalization.
+	// If this fails, we return the error so the finalizer retries.
+	// To force-delete, remove the finalizer manually.
+	if err := common.ResolveTargetClusterForManifest(ctx, r.localConfig, manifest, original); err != nil {
+		logger.Errorf("Failed to resolve target cluster for finalization: %v. "+
+			"Remote resources may need manual cleanup.", err)
+		return err
+	}
+
 	if err := common.Uninstall(manifest); err != nil {
 		logger.Error("Failed to finalize platform resources", err)
 	}
@@ -117,6 +130,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ks *v1beta1.KnativeServi
 		return err
 	}
 	stages := common.Stages{
+		common.ResolveTargetCluster(r.localConfig),
 		common.AppendTarget,
 		ingress.AppendTargetIngress,
 		security.AppendTargetSecurity,

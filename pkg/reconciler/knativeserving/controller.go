@@ -60,7 +60,8 @@ func NewExtendedController(generator common.ExtensionGenerator) injection.Contro
 		kubeClient := kubeclient.Get(ctx)
 		logger := logging.FromContext(ctx)
 
-		mfclient, err := mfc.NewClient(injection.GetConfig(ctx))
+		restConfig := injection.GetConfig(ctx)
+		mfclient, err := mfc.NewClient(restConfig)
 		if err != nil {
 			logger.Fatalw("Error creating client from injected config", zap.Error(err))
 		}
@@ -71,6 +72,7 @@ func NewExtendedController(generator common.ExtensionGenerator) injection.Contro
 			kubeClientSet:     kubeClient,
 			operatorClientSet: operatorclient.Get(ctx),
 			manifest:          manifest,
+			localConfig:       restConfig,
 		}
 		impl := knsreconciler.NewImpl(ctx, c)
 		c.extension = generator(ctx, impl)

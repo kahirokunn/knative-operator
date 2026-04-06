@@ -253,6 +253,17 @@ rules:
   - pods
   verbs:
   - get
+# Multi-cluster support: read ClusterProfile resources.
+# Requires the Cluster Inventory API CRD (multicluster.x-k8s.io).
+# These permissions are harmless if the CRD is not installed.
+- apiGroups:
+  - multicluster.x-k8s.io
+  resources:
+  - clusterprofiles
+  verbs:
+  - get
+  - list
+  - watch
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -643,4 +654,15 @@ rules:
       - update
       - list
       - get
+      - watch
+  # Multi-cluster support: read ClusterProfile resources.
+  # Requires the Cluster Inventory API CRD (multicluster.x-k8s.io).
+  # These permissions are harmless if the CRD is not installed.
+  - apiGroups:
+      - multicluster.x-k8s.io
+    resources:
+      - clusterprofiles
+    verbs:
+      - get
+      - list
       - watch
