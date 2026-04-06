@@ -24,6 +24,7 @@ import (
 	mf "github.com/manifestival/manifestival"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"knative.dev/operator/pkg/apis/operator/base"
 	"knative.dev/operator/pkg/apis/operator/v1beta1"
 	"knative.dev/pkg/ptr"
 )
@@ -68,6 +69,82 @@ func TestCommonTransformers(t *testing.T) {
 	}
 	ownerRef := resource.GetOwnerReferences()[0]
 
+	apiVersion, kind := component.GroupVersionKind().ToAPIVersionAndKind()
+	wantOwnerRef := metav1.OwnerReference{
+		APIVersion:         apiVersion,
+		Kind:               kind,
+		Name:               component.GetName(),
+		Controller:         ptr.Bool(true),
+		BlockOwnerDeletion: ptr.Bool(true),
+	}
+
+	if !cmp.Equal(ownerRef, wantOwnerRef) {
+		t.Fatalf("Unexpected ownerRef: %s", cmp.Diff(ownerRef, wantOwnerRef))
+	}
+}
+
+func TestInjectOwner_SkipsWhenClusterProfileRefSet(t *testing.T) {
+	// When ClusterProfileRef is set, injectOwner must NOT set OwnerReferences,
+	// because the owner CR does not exist on the remote cluster.
+	component := &v1beta1.KnativeEventing{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      "test-name",
+		},
+		Spec: v1beta1.KnativeEventingSpec{
+			CommonSpec: base.CommonSpec{
+				ClusterProfileRef: &base.ClusterProfileReference{
+					Name:      "remote-cluster",
+					Namespace: "fleet-system",
+				},
+			},
+		},
+	}
+	in := []unstructured.Unstructured{*NamespacedResource("test/v1", "TestCR", "some-ns", "test-resource")}
+	manifest, err := mf.ManifestFrom(mf.Slice(in))
+	if err != nil {
+		t.Fatalf("Failed to generate manifest: %v", err)
+	}
+
+	transformer := injectOwner(component)
+	m, err := manifest.Transform(transformer)
+	if err != nil {
+		t.Fatalf("Failed to transform manifest: %v", err)
+	}
+
+	resource := &m.Resources()[0]
+	if len(resource.GetOwnerReferences()) != 0 {
+		t.Fatalf("Expected no OwnerReferences when ClusterProfileRef is set, got %d",
+			len(resource.GetOwnerReferences()))
+	}
+}
+
+func TestInjectOwner_SetsOwnerRefWhenNoClusterProfileRef(t *testing.T) {
+	// Without ClusterProfileRef, injectOwner must set OwnerReferences as usual.
+	component := &v1beta1.KnativeEventing{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      "test-name",
+		},
+	}
+	in := []unstructured.Unstructured{*NamespacedResource("test/v1", "TestCR", "some-ns", "test-resource")}
+	manifest, err := mf.ManifestFrom(mf.Slice(in))
+	if err != nil {
+		t.Fatalf("Failed to generate manifest: %v", err)
+	}
+
+	transformer := injectOwner(component)
+	m, err := manifest.Transform(transformer)
+	if err != nil {
+		t.Fatalf("Failed to transform manifest: %v", err)
+	}
+
+	resource := &m.Resources()[0]
+	if len(resource.GetOwnerReferences()) == 0 {
+		t.Fatal("Expected OwnerReferences to be set when ClusterProfileRef is nil")
+	}
+
+	ownerRef := resource.GetOwnerReferences()[0]
 	apiVersion, kind := component.GroupVersionKind().ToAPIVersionAndKind()
 	wantOwnerRef := metav1.OwnerReference{
 		APIVersion:         apiVersion,
