@@ -79,6 +79,9 @@ type KComponentSpec interface {
 
 	// GetPodDisruptionBudgetOverride gets the PodDisruptionBudget configurations to override.
 	GetPodDisruptionBudgetOverride() []PodDisruptionBudgetOverride
+
+	// GetClusterProfileRef returns a reference to a ClusterProfile for multi-cluster deployment.
+	GetClusterProfileRef() *ClusterProfileReference
 }
 
 // KComponentStatus is a common interface for status mutations of all known types.
@@ -176,6 +179,13 @@ type CommonSpec struct {
 	// PodDisruptionBudgetOverride overrides PodDisruptionBudget configurations via minAvailable.
 	// +optional
 	PodDisruptionBudgetOverride []PodDisruptionBudgetOverride `json:"podDisruptionBudgets,omitempty"`
+
+	// ClusterProfileRef is an optional reference to a ClusterProfile resource
+	// (multicluster.x-k8s.io/v1alpha1). When set, the operator reconciles
+	// the component on the remote cluster described by the referenced
+	// ClusterProfile instead of the local cluster.
+	// +optional
+	ClusterProfileRef *ClusterProfileReference `json:"clusterProfileRef,omitempty"`
 }
 
 // GetConfig implements KComponentSpec.
@@ -231,6 +241,11 @@ func (c *CommonSpec) GetServiceOverride() []ServiceOverride {
 // GetPodDisruptionBudgetOverride implements KComponentSpec.
 func (c *CommonSpec) GetPodDisruptionBudgetOverride() []PodDisruptionBudgetOverride {
 	return c.PodDisruptionBudgetOverride
+}
+
+// GetClusterProfileRef implements KComponentSpec.
+func (c *CommonSpec) GetClusterProfileRef() *ClusterProfileReference {
+	return c.ClusterProfileRef
 }
 
 // ConfigMapData is a nested map of maps representing all upstream ConfigMaps. The first
@@ -430,4 +445,15 @@ type CustomCerts struct {
 
 	// The name of the ConfigMap or Secret
 	Name string `json:"name"`
+}
+
+// ClusterProfileReference identifies a ClusterProfile resource from the
+// Cluster Inventory API (multicluster.x-k8s.io/v1alpha1).
+// When set, the operator deploys resources to the remote cluster described by
+// this ClusterProfile instead of the local cluster.
+type ClusterProfileReference struct {
+	// Name is the name of the ClusterProfile resource.
+	Name string `json:"name"`
+	// Namespace is the namespace of the ClusterProfile resource.
+	Namespace string `json:"namespace"`
 }
