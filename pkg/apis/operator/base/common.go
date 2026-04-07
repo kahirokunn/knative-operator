@@ -348,7 +348,7 @@ type PodDisruptionBudgetOverride struct {
 	// Name is the name of the podDisruptionBudget to override.
 	Name string `json:"name"`
 	// The desired PodDisruptionBudgetSpec
-	policyv1.PodDisruptionBudgetSpec
+	policyv1.PodDisruptionBudgetSpec `json:",inline"`
 }
 
 // ResourceRequirementsOverride enables the user to override any container's
@@ -357,7 +357,7 @@ type ResourceRequirementsOverride struct {
 	// The container name
 	Container string `json:"container"`
 	// The desired ResourceRequirements
-	corev1.ResourceRequirements
+	corev1.ResourceRequirements `json:",inline"`
 }
 
 // EnvRequirementsOverride enables the user to override any container's env vars.

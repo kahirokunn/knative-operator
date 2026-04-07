@@ -53,6 +53,19 @@ kube::codegen::gen_helpers \
   --boilerplate "${REPO_ROOT_DIR}/hack/boilerplate/boilerplate.go.txt" \
   "${REPO_ROOT_DIR}/pkg/apis"
 
+group "CRD Gen"
+
+# Install controller-gen if not already available
+GOFLAGS=-mod=mod go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1
+export PATH="$(go env GOPATH)/bin:$PATH"
+
+# Generate CRD manifests from Go types using controller-gen.
+# This ensures CRD schemas stay in sync with the API type definitions.
+GOFLAGS=-mod=mod controller-gen \
+  crd:allowDangerousTypes=true,ignoreUnexportedFields=true,headerFile="${REPO_ROOT_DIR}/hack/boilerplate/boilerplate.yaml.txt" \
+  paths="${REPO_ROOT_DIR}/pkg/apis/..." \
+  output:crd:dir="${REPO_ROOT_DIR}/config/crd/bases"
+
 group "Update deps post-codegen"
 
 # Make sure our dependencies are up-to-date
