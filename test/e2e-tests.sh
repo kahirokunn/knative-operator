@@ -28,6 +28,14 @@
 
 source $(dirname $0)/e2e-common.sh
 
+# Multi-cluster e2e requires /bin/sh and /bin/cat in the operator container so
+# the access provider exec plugin can run. The default ko base image
+# (distroless/static) lacks both, so we override before initialize triggers
+# `ko apply`.
+if [[ "${TEST_MULTICLUSTER_E2E:-}" == "1" ]]; then
+  export KO_DEFAULTBASEIMAGE="${KO_DEFAULTBASEIMAGE:-cgr.dev/chainguard/busybox:latest}"
+fi
+
 function knative_setup() {
   create_namespace
   install_operator
@@ -35,6 +43,16 @@ function knative_setup() {
 
 # Skip installing istio as an add-on
 initialize $@
+
+if [[ "${TEST_MULTICLUSTER_E2E:-}" == "1" ]]; then
+  # Register cleanup BEFORE running setup so a partial failure (e.g. CRD
+  # install fails after `kind create cluster` succeeds) still tears the
+  # spoke cluster down. dump_spoke_state runs first so the artifact is
+  # written before the cluster is gone.
+  add_trap "dump_spoke_state; delete_spoke_cluster" EXIT
+  setup_multicluster_e2e || fail_test "failed to set up spoke cluster"
+  export SPOKE_KUBECONFIG SPOKE_HOST_KUBECONFIG
+fi
 
 # If we got this far, the operator installed Knative Serving
 header "Running tests for Knative Operator"

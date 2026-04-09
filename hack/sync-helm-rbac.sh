@@ -32,7 +32,10 @@ BOILERPLATE_YAML="${REPO_ROOT_DIR}/hack/boilerplate/boilerplate.yaml.txt"
 mkdir -p "${HELM_RBAC_DIR}"
 
 # Ensure a recent mikefarah/yq.
-GOFLAGS=-mod=mod go install github.com/mikefarah/yq/v4@v4.52.5
+YQ_VERSION="v4.52.5"
+if ! command -v yq &>/dev/null || ! yq --version 2>/dev/null | grep -q "${YQ_VERSION}"; then
+  GOFLAGS=-mod=mod go install "github.com/mikefarah/yq/v4@${YQ_VERSION}"
+fi
 YQ_BIN_DIR="$(go env GOBIN)"
 YQ_BIN_DIR="${YQ_BIN_DIR:-$(go env GOPATH)/bin}"
 export PATH="${YQ_BIN_DIR}:$PATH"

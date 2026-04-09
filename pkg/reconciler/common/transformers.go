@@ -28,7 +28,6 @@ import (
 func transformers(ctx context.Context, obj base.KComponent) []mf.Transformer {
 	logger := logging.FromContext(ctx)
 	return []mf.Transformer{
-		injectOwner(obj),
 		mf.InjectNamespace(obj.GetNamespace()),
 		NamespaceConfigurationTransform(obj.GetSpec().GetNamespaceConfiguration()),
 		HighAvailabilityTransform(obj),
@@ -43,11 +42,23 @@ func transformers(ctx context.Context, obj base.KComponent) []mf.Transformer {
 	}
 }
 
-func injectOwner(owner mf.Owner) mf.Transformer {
+// InjectOwner returns a Transformer that sets the OwnerReference on
+// namespace-scoped resources. For remote clusters (anchorOwner != nil),
+// the anchor ConfigMap is used as the owner. For local clusters
+// (anchorOwner == nil), the CR itself is the owner.
+// Cluster-scoped resources are skipped; FinalizeKind handles their cleanup.
+func InjectOwner(owner mf.Owner, anchorOwner mf.Owner) mf.Transformer {
 	return func(u *unstructured.Unstructured) error {
-		if u.GetNamespace() != "" {
-			u.SetOwnerReferences([]v1.OwnerReference{*v1.NewControllerRef(owner, owner.GroupVersionKind())})
+		if u.GetNamespace() == "" {
+			return nil // cluster-scoped resources: no ownerReference
 		}
+		effectiveOwner := owner
+		if anchorOwner != nil {
+			effectiveOwner = anchorOwner
+		}
+		u.SetOwnerReferences([]v1.OwnerReference{
+			*v1.NewControllerRef(effectiveOwner, effectiveOwner.GroupVersionKind()),
+		})
 		return nil
 	}
 }

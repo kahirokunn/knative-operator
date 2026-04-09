@@ -320,3 +320,269 @@ function if_version_exists() {
   done
   echo "no"
 }
+
+# ---------------------------------------------------------------------------
+# Multi-cluster e2e helpers (Cluster Inventory API / spoke cluster bootstrap)
+#
+# Activated only when TEST_MULTICLUSTER_E2E=1 is exported. None of these
+# functions are referenced from the existing single-cluster code paths, and
+# they intentionally do not modify the helpers above.
+# ---------------------------------------------------------------------------
+
+# Note: intentionally not marked readonly so the file can be sourced more than
+# once (e.g. from interactive shells or wrapping harnesses) and so individual
+# variables can be overridden from the environment.
+: "${SPOKE_CLUSTER_NAME:=spoke}"
+: "${SPOKE_KUBECONFIG:=/tmp/spoke.kubeconfig}"
+: "${SPOKE_HOST_KUBECONFIG:=/tmp/spoke-host.kubeconfig}"
+: "${CLUSTER_INVENTORY_CRD_URL:=https://raw.githubusercontent.com/kubernetes-sigs/cluster-inventory-api/v0.1.0/config/crd/bases/multicluster.x-k8s.io_clusterprofiles.yaml}"
+: "${MC_PROVIDER_CONFIGMAP:=clusterprofile-provider-file}"
+: "${MC_PROVIDER_TOKEN_SECRET:=clusterprofile-provider-token}"
+: "${MC_PROVIDER_MOUNT_PATH:=/etc/cluster-inventory}"
+: "${MC_PROVIDER_TOKEN_MOUNT_PATH:=/etc/cluster-inventory/access}"
+: "${MC_PROVIDER_NAME:=e2e-static-token}"
+export SPOKE_CLUSTER_NAME SPOKE_KUBECONFIG SPOKE_HOST_KUBECONFIG
+export CLUSTER_INVENTORY_CRD_URL MC_PROVIDER_CONFIGMAP MC_PROVIDER_TOKEN_SECRET
+export MC_PROVIDER_MOUNT_PATH MC_PROVIDER_TOKEN_MOUNT_PATH MC_PROVIDER_NAME
+
+function create_spoke_cluster() {
+  echo ">> Creating spoke KinD cluster: ${SPOKE_CLUSTER_NAME}"
+  if kind get clusters 2>/dev/null | grep -q "^${SPOKE_CLUSTER_NAME}$"; then
+    echo ">> Spoke cluster already exists, reusing"
+  else
+    kind create cluster --name "${SPOKE_CLUSTER_NAME}" --wait 120s || return 1
+  fi
+  # IMPORTANT: --internal is required so the hub pod can reach the spoke API
+  # server via the shared 'kind' docker bridge. The host kubeconfig
+  # (127.0.0.1:<port>) will not work from inside a pod.
+  kind get kubeconfig --internal --name "${SPOKE_CLUSTER_NAME}" > "${SPOKE_KUBECONFIG}" || return 1
+  # The --internal kubeconfig cannot be dialled from the runner host, so we
+  # also export a host-reachable copy used for `kubectl wait` and dumps.
+  kind get kubeconfig --name "${SPOKE_CLUSTER_NAME}" > "${SPOKE_HOST_KUBECONFIG}" || return 1
+  export SPOKE_KUBECONFIG SPOKE_HOST_KUBECONFIG
+  echo ">> Spoke kubeconfig written to ${SPOKE_KUBECONFIG} (internal) and ${SPOKE_HOST_KUBECONFIG} (host)"
+
+  # Wait for the spoke API server to be fully ready before issuing
+  # TokenRequest API calls. `kind create --wait` only blocks on node Ready
+  # condition; the SA token controller and TokenRequest API may still be
+  # racing.
+  echo ">> Waiting for spoke nodes and core components"
+  KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl wait --for=condition=Ready node --all --timeout=120s || return 1
+  KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl -n kube-system rollout status deployment/coredns --timeout=120s || return 1
+}
+
+function delete_spoke_cluster() {
+  if kind get clusters 2>/dev/null | grep -q "^${SPOKE_CLUSTER_NAME}$"; then
+    kind delete cluster --name "${SPOKE_CLUSTER_NAME}" || true
+  fi
+  rm -f "${SPOKE_KUBECONFIG}" "${SPOKE_HOST_KUBECONFIG}"
+}
+
+# dump_spoke_state writes a snapshot of the spoke cluster (resources + events)
+# to ARTIFACTS so failures in CI leave actionable forensic data behind.
+function dump_spoke_state() {
+  if [[ -z "${SPOKE_HOST_KUBECONFIG:-}" || ! -f "${SPOKE_HOST_KUBECONFIG}" ]]; then
+    return 0
+  fi
+  local out="${ARTIFACTS:-/tmp}/spoke-dump.txt"
+  echo ">> Dumping spoke cluster state to ${out}"
+  {
+    echo "=== kubectl get all -A ==="
+    KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl get all -A -o wide || true
+    echo
+    echo "=== kubectl get events -A ==="
+    KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl get events -A --sort-by=.lastTimestamp || true
+    echo
+    echo "=== kubectl get nodes ==="
+    KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl get nodes -o wide || true
+  } > "${out}" 2>&1 || true
+}
+
+function install_cluster_inventory_crd() {
+  echo ">> Installing ClusterProfile CRD on hub"
+  kubectl apply -f "${CLUSTER_INVENTORY_CRD_URL}" || return 1
+  kubectl wait --for=condition=Established --timeout=60s \
+    crd/clusterprofiles.multicluster.x-k8s.io || return 1
+}
+
+function create_spoke_kubeconfig_secret() {
+  local ns="$1"
+  kubectl create namespace "${ns}" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "${ns}" create secret generic spoke-kubeconfig \
+    --from-file=kubeconfig="${SPOKE_KUBECONFIG}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
+# _spoke_bootstrap_token creates a cluster-admin ServiceAccount on the spoke
+# and prints its bearer token to stdout. The token is later exposed to the
+# hub operator pod through the access provider exec plugin.
+#
+# The token line itself is emitted to stdout (so callers can capture it via
+# command substitution) but xtrace is suppressed around the `create token`
+# call so the bearer token never lands in CI logs verbatim when the harness
+# is run with `set -x`.
+function _spoke_bootstrap_token() {
+  local sa_ns="kube-system"
+  local sa_name="knative-operator-e2e"
+  KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl -n "${sa_ns}" create serviceaccount "${sa_name}" \
+    --dry-run=client -o yaml | KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl apply -f - >/dev/null
+  KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl create clusterrolebinding "${sa_name}" \
+    --clusterrole=cluster-admin \
+    --serviceaccount="${sa_ns}:${sa_name}" \
+    --dry-run=client -o yaml | KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl apply -f - >/dev/null
+  { set +x; } 2>/dev/null
+  KUBECONFIG="${SPOKE_HOST_KUBECONFIG}" kubectl -n "${sa_ns}" create token "${sa_name}" --duration=24h
+}
+
+# _spoke_endpoint extracts the internal API server URL from the spoke
+# kubeconfig (the one obtained with --internal).
+function _spoke_endpoint() {
+  KUBECONFIG="${SPOKE_KUBECONFIG}" kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+}
+
+# _spoke_ca_b64 extracts the spoke API server CA bundle (already base64-encoded
+# in the kubeconfig) and prints it.
+function _spoke_ca_b64() {
+  KUBECONFIG="${SPOKE_KUBECONFIG}" kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}'
+}
+
+function apply_cluster_profile() {
+  local cp_namespace="${1:-default}"
+  echo ">> Applying ClusterProfile CR for spoke in namespace ${cp_namespace}"
+  kubectl create namespace "${cp_namespace}" --dry-run=client -o yaml | kubectl apply -f -
+
+  export SPOKE_CLUSTER_NAME
+  SPOKE_INTERNAL_ENDPOINT="$(_spoke_endpoint)" || return 1
+  SPOKE_CA_DATA_B64="$(_spoke_ca_b64)" || return 1
+  export SPOKE_INTERNAL_ENDPOINT SPOKE_CA_DATA_B64
+
+  envsubst < test/config/multicluster/clusterprofile.yaml.tmpl \
+    | kubectl -n "${cp_namespace}" apply -f - || return 1
+
+  # Wait until the ClusterProfile is observable through the hub apiserver so
+  # the operator informer has a chance to populate before tests start
+  # reconciling.
+  local i
+  for i in $(seq 1 30); do
+    if kubectl -n "${cp_namespace}" get clusterprofile "${SPOKE_CLUSTER_NAME}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: timed out waiting for ClusterProfile/${SPOKE_CLUSTER_NAME} in ${cp_namespace}" >&2
+  return 1
+}
+
+# install_access_provider_config builds the access-provider plumbing
+# for the hub operator:
+#
+#   1. A ConfigMap (MC_PROVIDER_CONFIGMAP) with two non-secret entries:
+#        - config.json : the access-provider JSON consumed by --clusterprofile-provider-file
+#        - exec.sh     : a tiny shell exec plugin that reads the token from the mounted Secret
+#   2. A Secret (MC_PROVIDER_TOKEN_SECRET) carrying ONLY the bearer token under key "token".
+#   3. A patch on the operator deployment that mounts both volumes and adds
+#      --clusterprofile-provider-file. The patch uses a JSON patch (`add`)
+#      so it does not clobber any existing args/volumes on the container.
+#
+# Requires: TEST_MULTICLUSTER_E2E=1 and an operator image with /bin/sh and
+# /bin/cat available (see KO_DEFAULTBASEIMAGE override in e2e-tests.sh).
+function install_access_provider_config() {
+  echo ">> Installing access provider ConfigMap/Secret and patching operator deployment"
+  local token
+  token="$(_spoke_bootstrap_token)" || return 1
+  if [[ -z "${token}" ]]; then
+    echo "ERROR: failed to obtain spoke service account token" >&2
+    return 1
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)" || return 1
+
+  cat > "${tmpdir}/provider-config.json" <<EOF
+{
+  "providers": [
+    {
+      "name": "${MC_PROVIDER_NAME}",
+      "execConfig": {
+        "apiVersion": "client.authentication.k8s.io/v1",
+        "command": "/bin/sh",
+        "args": ["${MC_PROVIDER_MOUNT_PATH}/exec.sh"],
+        "interactiveMode": "Never"
+      }
+    }
+  ]
+}
+EOF
+
+  # The exec plugin reads the bearer token from a file mounted from a Secret
+  # at runtime. The token value is NOT baked into the script so a
+  # `kubectl describe configmap` cannot leak it.
+  cat > "${tmpdir}/exec.sh" <<EOF
+#!/bin/sh
+TOKEN=\$(cat ${MC_PROVIDER_TOKEN_MOUNT_PATH}/token)
+cat <<JSON
+{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"\${TOKEN}"}}
+JSON
+EOF
+  chmod +x "${tmpdir}/exec.sh"
+
+  kubectl -n "${TEST_OPERATOR_NAMESPACE}" create configmap "${MC_PROVIDER_CONFIGMAP}" \
+    --from-file=config.json="${tmpdir}/provider-config.json" \
+    --from-file=exec.sh="${tmpdir}/exec.sh" \
+    --dry-run=client -o yaml | kubectl apply -f - || { rm -rf "${tmpdir}"; return 1; }
+
+  # Write the token to a temp file so it never appears on a kubectl command
+  # line (which would land in `ps`/audit logs).
+  local token_file="${tmpdir}/token"
+  ( { set +x; } 2>/dev/null; printf '%s' "${token}" > "${token_file}" )
+  chmod 600 "${token_file}"
+
+  kubectl -n "${TEST_OPERATOR_NAMESPACE}" create secret generic "${MC_PROVIDER_TOKEN_SECRET}" \
+    --from-file=token="${token_file}" \
+    --dry-run=client -o yaml | kubectl apply -f - || { rm -rf "${tmpdir}"; return 1; }
+
+  rm -rf "${tmpdir}"
+
+  # Patch the operator deployment using a JSON patch with `add` operations.
+  # config/manager/operator.yaml does not currently set `args` or `volumes`
+  # on the knative-operator container, so the strategic-merge `args` clobber
+  # risk is real if upstream ever adds defaults — using JSON patch with
+  # explicit `add` keeps the patch surgical (whole-array replacement only
+  # happens for the keys we explicitly add).
+  kubectl -n "${TEST_OPERATOR_NAMESPACE}" patch deployment knative-operator \
+    --type=json \
+    -p "$(cat <<EOF
+[
+  {"op": "add", "path": "/spec/template/spec/containers/0/args", "value": ["--clusterprofile-provider-file=${MC_PROVIDER_MOUNT_PATH}/config.json"]},
+  {"op": "add", "path": "/spec/template/spec/volumes", "value": [
+    {"name": "access-config", "configMap": {"name": "${MC_PROVIDER_CONFIGMAP}", "defaultMode": 493}},
+    {"name": "provider-token", "secret": {"secretName": "${MC_PROVIDER_TOKEN_SECRET}", "defaultMode": 256}}
+  ]},
+  {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts", "value": [
+    {"name": "access-config", "mountPath": "${MC_PROVIDER_MOUNT_PATH}", "readOnly": true},
+    {"name": "provider-token", "mountPath": "${MC_PROVIDER_TOKEN_MOUNT_PATH}", "readOnly": true}
+  ]}
+]
+EOF
+)" || return 1
+
+  kubectl -n "${TEST_OPERATOR_NAMESPACE}" rollout status deployment/knative-operator --timeout=180s || return 1
+}
+
+function setup_multicluster_e2e() {
+  # Pre-flight: ensure required tools are available before we start spinning
+  # up clusters. Failing fast here gives a clearer error than a half-created
+  # KinD cluster with a "command not found" trace.
+  local cmd
+  for cmd in kind envsubst kubectl ko docker; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      echo "ERROR: required command not found: ${cmd}" >&2
+      return 1
+    fi
+  done
+
+  create_spoke_cluster || return 1
+  install_cluster_inventory_crd || return 1
+  install_access_provider_config || return 1
+  apply_cluster_profile "default" || return 1
+}

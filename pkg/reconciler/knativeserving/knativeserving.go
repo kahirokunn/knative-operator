@@ -18,12 +18,14 @@ package knativeserving
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	mf "github.com/manifestival/manifestival"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 
+	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
 
@@ -31,6 +33,7 @@ import (
 	"knative.dev/operator/pkg/apis/operator/v1beta1"
 	clientset "knative.dev/operator/pkg/client/clientset/versioned"
 	knsreconciler "knative.dev/operator/pkg/client/injection/reconciler/operator/v1beta1/knativeserving"
+	operatorv1beta1lister "knative.dev/operator/pkg/client/listers/operator/v1beta1"
 	"knative.dev/operator/pkg/reconciler/common"
 	ksc "knative.dev/operator/pkg/reconciler/knativeserving/common"
 	"knative.dev/operator/pkg/reconciler/knativeserving/ingress"
@@ -51,6 +54,10 @@ type Reconciler struct {
 	manifest mf.Manifest
 	// Platform-specific behavior to affect the transform
 	extension common.Extension
+	// clusterProvider resolves ClusterProfile references for multi-cluster deployment
+	clusterProvider *common.ClusterProvider
+	// servingLister provides cached listing of KnativeServing resources
+	servingLister operatorv1beta1lister.KnativeServingLister
 }
 
 // Check that our Reconciler implements controller.Reconciler
@@ -60,21 +67,18 @@ var _ knsreconciler.Finalizer = (*Reconciler)(nil)
 // FinalizeKind removes all resources after deletion of a KnativeServing.
 func (r *Reconciler) FinalizeKind(ctx context.Context, original *v1beta1.KnativeServing) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
-
-	// Clean up the cache, if the Serving CR is deleted.
 	common.ClearCache()
 
-	// List all KnativeServings to determine if cluster-scoped resources should be deleted.
-	kss, err := r.operatorClientSet.OperatorV1beta1().KnativeServings("").List(ctx, metav1.ListOptions{})
+	kss, err := r.servingLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list all KnativeServings: %w", err)
 	}
-
-	for _, ks := range kss.Items {
-		if ks.GetDeletionTimestamp().IsZero() {
-			// Not deleting all KnativeServings. Nothing to do here.
-			return nil
-		}
+	components := make([]base.KComponent, len(kss))
+	for i, ks := range kss {
+		components[i] = ks
+	}
+	if !common.ShouldFinalizeClusterScoped(components, original) {
+		return nil
 	}
 
 	if err := r.extension.Finalize(ctx, original); err != nil {
@@ -84,14 +88,39 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, original *v1beta1.Knative
 	manifest, err := r.installed(ctx, original)
 	if err != nil {
 		logger.Error("Unable to fetch installed manifest; no cluster-scoped resources will be finalized", err)
+		manifest = nil
+	}
+
+	cpRef := original.Spec.ClusterProfileRef
+	if cpRef != nil {
+		clusterName := cpRef.Namespace + "/" + cpRef.Name
+		// Use Get instead of GetOrRefresh: the finalizer must not block on
+		// an access-provider call that can hang while the target cluster
+		// is being torn down.
+		entry, reason, err := r.clusterProvider.Get(ctx, clusterName)
+		if err != nil {
+			if errors.Is(err, common.ErrClusterNotResolved) {
+				logger.Warnf("ClusterProfile %s not yet resolved; remote resources may be orphaned. "+
+					"Remove finalizer manually if cluster is permanently gone.", clusterName)
+			} else if errors.Is(err, common.ErrClusterStale) {
+				logger.Warnf("ClusterProfile %s connection stale; remote resources may be orphaned. "+
+					"Will retry on next reconcile.", clusterName)
+			}
+			original.Status.MarkTargetClusterNotResolved(
+				reason,
+				fmt.Sprintf("ClusterProfile %s unavailable: %v", clusterName, err))
+			return err
+		}
+
+		if err := common.FinalizeRemoteCluster(ctx, entry, manifest, original); err != nil {
+			return fmt.Errorf("remote finalization: %w", err)
+		}
 		return nil
 	}
 
 	if manifest == nil {
-		logger.Warnf("No manifest found; no cluster-scoped resources will be finalized")
 		return nil
 	}
-
 	if err := common.Uninstall(manifest); err != nil {
 		logger.Error("Failed to finalize platform resources", err)
 	}
@@ -116,13 +145,19 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ks *v1beta1.KnativeServi
 	if err := r.extension.Reconcile(ctx, ks); err != nil {
 		return err
 	}
+
+	var state common.ReconcileState
+
 	stages := common.Stages{
+		common.ResolveTargetCluster(r.clusterProvider, &state),
 		common.AppendTarget,
 		ingress.AppendTargetIngress,
 		security.AppendTargetSecurity,
 		common.AppendAdditionalManifests,
 		r.appendExtensionManifests,
-		r.transform,
+		func(ctx context.Context, manifest *mf.Manifest, comp base.KComponent) error {
+			return r.transform(ctx, manifest, comp, state.AnchorOwner)
+		},
 		manifests.Install,
 		manifests.SetManifestPaths,    // setting path right after applying manifests to populate paths
 		common.CheckWebhookDeployment, // Wait for webhook to be ready before creating Certificate resources
@@ -132,15 +167,25 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ks *v1beta1.KnativeServi
 		common.DeleteObsoleteResources(ctx, ks, r.installed),
 	}
 	manifest := r.manifest.Append()
-	return stages.Execute(ctx, &manifest, ks)
+	result, err := stages.Execute(ctx, &manifest, ks)
+	if err != nil {
+		return err
+	}
+	// Remote clusters have no Deployment informer to re-queue this CR once
+	// the rollout completes, so poll until the deployments report ready.
+	if result.DeploymentsNotReady && state.IsRemote() {
+		return controller.NewRequeueAfter(common.RemoteDeploymentsPollInterval)
+	}
+	return nil
 }
 
 // transform mutates the passed manifest to one with common, component
 // and platform transformations applied
-func (r *Reconciler) transform(ctx context.Context, manifest *mf.Manifest, comp base.KComponent) error {
+func (r *Reconciler) transform(ctx context.Context, manifest *mf.Manifest, comp base.KComponent, anchorOwner mf.Owner) error {
 	logger := logging.FromContext(ctx)
 	instance := comp.(*v1beta1.KnativeServing)
 	extra := []mf.Transformer{
+		common.InjectOwner(instance, anchorOwner),
 		ksc.CustomCertsTransform(instance, logger),
 		ksc.AggregationRuleTransform(manifest.Client),
 		// Ensure all resources have the selector applied so that the controller re-queues applied resources when they change.
@@ -174,7 +219,7 @@ func (r *Reconciler) installed(ctx context.Context, instance base.KComponent) (*
 	// Per the manifests, that have been installed in the cluster, we only need to inject the correct namespace
 	// in the stages.
 	stages := common.Stages{r.injectNamespace}
-	err = stages.Execute(ctx, &installed, instance)
+	_, err = stages.Execute(ctx, &installed, instance)
 	return &installed, err
 }
 
