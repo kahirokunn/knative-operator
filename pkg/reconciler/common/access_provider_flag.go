@@ -1,0 +1,36 @@
+/*
+Copyright 2025 The Knative Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package common
+
+import "flag"
+
+var clusterprofileProviderFileFlag string
+
+func init() {
+	flag.StringVar(&clusterprofileProviderFileFlag, "clusterprofile-provider-file", "",
+		"Path to the JSON config file for Cluster Inventory API access providers "+
+			"(see sigs.k8s.io/cluster-inventory-api/pkg/access)")
+}
+
+// ClusterProfileProviderFile returns the --clusterprofile-provider-file flag value.
+// It must only be called after sharedmain has parsed flags, i.e. inside
+// controller constructors. Validation of the path (existence, readability,
+// JSON shape) is performed by access.NewFromFile inside NewClusterProvider,
+// and surfaced via logger.Fatalw in the constructor.
+func ClusterProfileProviderFile() string {
+	return clusterprofileProviderFileFlag
+}

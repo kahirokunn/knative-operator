@@ -1,0 +1,30 @@
+# Source template for the spoke ClusterProfile created by
+# test/e2e-common.sh::apply_cluster_profile.
+#
+# The bash harness fills in the following environment variables via envsubst
+# before applying:
+#
+#   ${SPOKE_CLUSTER_NAME}        - logical name of the spoke (also kind cluster name)
+#   ${SPOKE_INTERNAL_ENDPOINT}   - https://<container>:6443 reachable from hub pods
+#   ${SPOKE_CA_DATA_B64}         - base64-encoded CA certificate of the spoke apiserver
+#
+# The accessProviders entry must match a provider name registered in the
+# JSON file passed to the operator via --clusterprofile-provider-file.
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ClusterProfile
+metadata:
+  name: ${SPOKE_CLUSTER_NAME}
+  labels:
+    x-k8s.io/cluster-manager: knative-operator-e2e
+spec:
+  displayName: ${SPOKE_CLUSTER_NAME}
+  clusterManager:
+    name: knative-operator-e2e
+status:
+  version:
+    kubernetes: v1.29.0
+  accessProviders:
+  - name: e2e-static-token
+    cluster:
+      server: ${SPOKE_INTERNAL_ENDPOINT}
+      certificate-authority-data: ${SPOKE_CA_DATA_B64}

@@ -32,7 +32,11 @@ spec:
     singular: knativeeventing
   scope: Namespaced
   versions:
-  - name: v1beta1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterProfileRef.name
+      name: Target Cluster
+      type: string
+    name: v1beta1
     schema:
       openAPIV3Schema:
         description: KnativeEventing is the Schema for the eventings API
@@ -69,6 +73,25 @@ spec:
                   - URL
                   type: object
                 type: array
+              clusterProfileRef:
+                description: |-
+                  ClusterProfileRef is an optional reference to a ClusterProfile resource
+                  (multicluster.x-k8s.io/v1alpha1). When set, the operator reconciles
+                  the component on the remote cluster described by the referenced
+                  ClusterProfile instead of the local cluster.
+                properties:
+                  name:
+                    description: Name is the name of the ClusterProfile resource.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace is the namespace of the ClusterProfile resource.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
               config:
                 additionalProperties:
                   additionalProperties:
@@ -3363,6 +3386,9 @@ spec:
                   type: object
                 type: array
             type: object
+            x-kubernetes-validations:
+            - message: spec.clusterProfileRef is immutable
+              rule: (!has(self.clusterProfileRef) && !has(oldSelf.clusterProfileRef)) || (has(self.clusterProfileRef) && has(oldSelf.clusterProfileRef) && self.clusterProfileRef == oldSelf.clusterProfileRef)
           status:
             description: KnativeEventingStatus defines the observed state of KnativeEventing
             properties:

@@ -19,6 +19,7 @@ package common
 import (
 	"context"
 	"fmt"
+	"time"
 
 	mf "github.com/manifestival/manifestival"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -28,23 +29,47 @@ import (
 	"knative.dev/operator/pkg/apis/operator/base"
 )
 
+// RemoteDeploymentsPollInterval is how often a remote-cluster reconciler
+// re-queues a KComponent while it waits for Deployments to become ready.
+// Remote clusters have no Deployment informer to drive the re-queue, so we
+// poll. Short enough to detect a healthy rollout within a few ticks; long
+// enough to avoid hammering the API server. Avoids the default exponential
+// backoff (up to 15 minutes) which would be far too slow here.
+const RemoteDeploymentsPollInterval = 10 * time.Second
+
 // Stage represents a step in the reconcile process
 type Stage func(context.Context, *mf.Manifest, base.KComponent) error
 
 // Stages are a list of steps
 type Stages []Stage
 
+// ExecuteResult carries additional signals from stage execution that callers
+// may need to react to. It is separate from the error return so that
+// non-fatal conditions (like "deployments still rolling out") can be
+// surfaced without disrupting the existing error-handling contract.
+type ExecuteResult struct {
+	// DeploymentsNotReady is true when a stage reported that one or more
+	// Deployments are not yet Available. Execution is halted when this
+	// happens, but the result is not treated as an error because for
+	// local-cluster reconciles the Deployment informer will re-queue the
+	// KComponent once the rollout progresses. Remote-cluster reconcilers
+	// have no such informer and must use this flag to schedule a requeue.
+	DeploymentsNotReady bool
+}
+
 // Execute each stage in sequence until one returns an error
-func (stages Stages) Execute(ctx context.Context, manifest *mf.Manifest, instance base.KComponent) error {
+func (stages Stages) Execute(ctx context.Context, manifest *mf.Manifest, instance base.KComponent) (ExecuteResult, error) {
+	var result ExecuteResult
 	for _, stage := range stages {
 		if err := stage(ctx, manifest, instance); err != nil {
 			if IsDeploymentsNotReadyError(err) {
+				result.DeploymentsNotReady = true
 				break
 			}
-			return err
+			return result, err
 		}
 	}
-	return nil
+	return result, nil
 }
 
 // NoOp does nothing
@@ -95,6 +120,17 @@ func AppendInstalled(ctx context.Context, manifest *mf.Manifest, instance base.K
 	}
 	*manifest = manifest.Append(m)
 	return nil
+}
+
+// ReconcileState carries per-reconciliation context for multi-cluster deployments.
+type ReconcileState struct {
+	AnchorOwner   mf.Owner
+	RemoteClients RemoteClusterClients
+}
+
+// IsRemote returns true when the reconciliation targets a remote cluster.
+func (s *ReconcileState) IsRemote() bool {
+	return s.RemoteClients != nil
 }
 
 // ManifestFetcher returns a manifest appropriate for the instance

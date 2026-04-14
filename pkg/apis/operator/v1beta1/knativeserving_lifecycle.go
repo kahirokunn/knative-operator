@@ -34,6 +34,7 @@ var (
 		base.DeploymentsAvailable,
 		base.InstallSucceeded,
 		base.VersionMigrationEligible,
+		base.TargetClusterResolved,
 	)
 )
 
@@ -123,6 +124,23 @@ func (is *KnativeServingStatus) MarkDependencyMissing(msg string) {
 		base.DependenciesInstalled,
 		"Error",
 		"Dependency missing: %s", msg)
+}
+
+func (is *KnativeServingStatus) MarkTargetClusterResolved() {
+	servingCondSet.Manage(is).MarkTrue(base.TargetClusterResolved)
+}
+
+func (is *KnativeServingStatus) MarkTargetClusterNotResolved(reason, msg string) {
+	servingCondSet.Manage(is).MarkFalse(
+		base.TargetClusterResolved,
+		reason,
+		msg,
+	)
+	servingCondSet.Manage(is).MarkFalse(
+		base.InstallSucceeded,
+		"TargetClusterUnavailable",
+		"Cannot install: "+msg,
+	)
 }
 
 // GetVersion gets the currently installed version of the component.
