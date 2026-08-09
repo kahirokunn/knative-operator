@@ -18,6 +18,7 @@ package ingress
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	mf "github.com/manifestival/manifestival"
@@ -180,6 +181,45 @@ func TestTransformKourierManifest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReplaceBootstrapNamespace(t *testing.T) {
+	const customNamespace = "custom-serving"
+
+	client := fake.New()
+	manifest, err := mf.NewManifest("testdata/kodata/ingress/1.9/kourier/kourier.yaml", mf.UseClient(client))
+	if err != nil {
+		t.Fatalf("Failed to read manifest: %v", err)
+	}
+
+	manifest, err = manifest.Transform(
+		mf.InjectNamespace(customNamespace),
+		replaceBootstrapNamespace(),
+	)
+	if err != nil {
+		t.Fatalf("Failed to transform manifest: %v", err)
+	}
+
+	for _, u := range manifest.Resources() {
+		if u.GetKind() != "ConfigMap" || u.GetName() != kourierDefaultVolumeName {
+			continue
+		}
+
+		configMap := &v1.ConfigMap{}
+		if err := scheme.Scheme.Convert(&u, configMap, nil); err != nil {
+			t.Fatalf("Failed to convert bootstrap ConfigMap: %v", err)
+		}
+		bootstrap := configMap.Data[kourierBootstrapDataKey]
+		if strings.Contains(bootstrap, kourierDefaultNamespace) {
+			t.Fatalf("Bootstrap config still contains default namespace %q", kourierDefaultNamespace)
+		}
+		if want := "net-kourier-controller." + customNamespace; !strings.Contains(bootstrap, want) {
+			t.Fatalf("Bootstrap config does not contain controller address %q", want)
+		}
+		return
+	}
+
+	t.Fatal("Bootstrap ConfigMap not found")
 }
 
 func verifyGatewayServiceTypeNodePortHTTP(t *testing.T, u *unstructured.Unstructured, expHTTPPort int32) {
