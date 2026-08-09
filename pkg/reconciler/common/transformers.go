@@ -73,6 +73,10 @@ func Transform(ctx context.Context, manifest *mf.Manifest, instance base.KCompon
 		instance.GetStatus().MarkInstallFailed(err.Error())
 		return err
 	}
+	if err := ApplyResourcePatches(&m, instance.GetSpec().GetPatches()); err != nil {
+		instance.GetStatus().MarkInstallFailed(err.Error())
+		return err
+	}
 	*manifest = m
 	return nil
 }
