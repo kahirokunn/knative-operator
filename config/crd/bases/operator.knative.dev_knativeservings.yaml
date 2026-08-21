@@ -38,8 +38,15 @@ spec:
           path: /resource-conversion
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.clusterProfileRef.name
+    - jsonPath: .spec.placement.clusterProfileRef.name
       name: Target Cluster
+      type: string
+    - jsonPath: .spec.placement.namespace
+      name: Target Namespace
+      type: string
+    - jsonPath: .spec.clusterProfileRef.name
+      name: Legacy Target Cluster
+      priority: 1
       type: string
     name: v1beta1
     schema:
@@ -64,7 +71,13 @@ spec:
           metadata:
             type: object
           spec:
-            description: KnativeServingSpec defines the desired state of KnativeServing
+            description: |-
+              KnativeServingSpec defines the desired state of KnativeServing
+              Migration from clusterProfileRef to placement is intentionally staged: first add a matching
+              placement while retaining clusterProfileRef, then remove clusterProfileRef in a later update.
+              Single-step swaps are rejected; placement remains correctable while the legacy field exists
+              and becomes immutable after it is removed. Neither remote field can otherwise be introduced
+              after creation.
             properties:
               additionalManifests:
                 description: A means to specify the additional manifests to install
@@ -81,17 +94,23 @@ spec:
                 type: array
               clusterProfileRef:
                 description: |-
-                  ClusterProfileRef optionally targets a ClusterProfile; when set, the
-                  component is reconciled on the referenced remote cluster.
+                  ClusterProfileRef selects a remote cluster. When Placement is not set, the
+                  component is installed in the management CR's namespace on that cluster.
+
+                  Deprecated: use Placement to select both the remote cluster and installation namespace.
                 properties:
                   name:
                     description: Name is the name of the ClusterProfile resource.
+                    maxLength: 253
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   namespace:
                     description: Namespace is the namespace of the ClusterProfile
                       resource.
+                    maxLength: 63
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                 required:
                 - name
@@ -2118,6 +2137,43 @@ spec:
                       template.
                     type: object
                 type: object
+              placement:
+                description: |-
+                  Placement selects a remote cluster and the namespace where Knative is installed.
+                  This field is Alpha and may change without backward compatibility.
+                properties:
+                  clusterProfileRef:
+                    description: ClusterProfileRef identifies the ClusterProfile resource
+                      for the remote cluster.
+                    properties:
+                      name:
+                        description: Name is the name of the ClusterProfile resource.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                      namespace:
+                        description: Namespace is the namespace of the ClusterProfile
+                          resource.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  namespace:
+                    description: Namespace is the namespace on the remote cluster
+                      where Knative is installed.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                required:
+                - clusterProfileRef
+                - namespace
+                type: object
               podDisruptionBudgets:
                 description: PodDisruptionBudgetOverride overrides PodDisruptionBudget
                   configurations via minAvailable.
@@ -3995,11 +4051,22 @@ spec:
                 type: array
             type: object
             x-kubernetes-validations:
-            - message: spec.clusterProfileRef cannot be added or removed after creation
-              rule: has(self.clusterProfileRef) == has(oldSelf.clusterProfileRef)
+            - message: remote placement cannot be added or removed after creation
+              rule: (has(self.clusterProfileRef) || has(self.placement)) == (has(oldSelf.clusterProfileRef)
+                || has(oldSelf.placement))
             - message: spec.clusterProfileRef is immutable
-              rule: '!has(self.clusterProfileRef) || !has(oldSelf.clusterProfileRef)
-                || self.clusterProfileRef == oldSelf.clusterProfileRef'
+              rule: '!has(self.clusterProfileRef) || (has(oldSelf.clusterProfileRef)
+                && self.clusterProfileRef == oldSelf.clusterProfileRef)'
+            - message: spec.placement is immutable once spec.clusterProfileRef is
+                removed
+              rule: '!has(oldSelf.placement) || (has(self.placement) && (self.placement
+                == oldSelf.placement || has(self.clusterProfileRef)))'
+            - message: spec.clusterProfileRef cannot be removed until spec.placement
+                targets the same ClusterProfile in a prior update
+              rule: '!has(oldSelf.clusterProfileRef) || has(self.clusterProfileRef)
+                || (has(oldSelf.placement) && has(self.placement) && [self.placement.clusterProfileRef.name,
+                self.placement.clusterProfileRef.namespace] == [oldSelf.clusterProfileRef.name,
+                oldSelf.clusterProfileRef.namespace])'
           status:
             description: KnativeServingStatus defines the observed state of KnativeServing
             properties:

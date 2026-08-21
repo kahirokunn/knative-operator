@@ -95,8 +95,7 @@ func NewExtendedController(generator common.ExtensionGenerator) injection.Contro
 				}
 				var keys []types.NamespacedName
 				for _, ke := range kes {
-					ref := ke.Spec.ClusterProfileRef
-					if ref != nil && ref.Namespace == cpNamespace && ref.Name == cpName {
+					if ref := common.ClusterProfileRef(ke); ref != nil && ref.Namespace == cpNamespace && ref.Name == cpName {
 						keys = append(keys, types.NamespacedName{
 							Namespace: ke.Namespace, Name: ke.Name,
 						})

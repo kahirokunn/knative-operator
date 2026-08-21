@@ -142,6 +142,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ke *v1beta1.KnativeEvent
 		manifests.Install,
 		manifests.SetManifestPaths, // setting path right after applying manifests to populate paths
 		common.CheckDeployments,
+		common.AdoptRemoteRuntimeResources(&state),
 		common.MarkStatusSuccess,
 		common.DeleteObsoleteResources(ctx, ke, r.installed),
 	}

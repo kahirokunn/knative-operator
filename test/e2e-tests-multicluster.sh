@@ -24,7 +24,8 @@ set -o pipefail
 # Must be set before sourcing e2e-common.sh (hack defaults to gke).
 export CLOUD_PROVIDER=kind
 export KO_DOCKER_REPO=kind.local
-export KIND_CLUSTER_NAME=kind
+: "${KIND_CLUSTER_NAME:=kind}"
+export KIND_CLUSTER_NAME
 
 source "$(dirname "$0")/e2e-common.sh"
 

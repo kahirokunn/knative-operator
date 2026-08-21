@@ -27,4 +27,5 @@ const (
 	ReasonAccessProviderNotConfigured = "AccessProviderNotConfigured"
 	ReasonClusterProviderClosed       = "ClusterProviderClosed"
 	ReasonRemoteClusterStale          = "RemoteClusterStale"
+	ReasonInvalidPlacement            = "InvalidPlacement"
 )

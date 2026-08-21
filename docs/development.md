@@ -34,8 +34,9 @@ go test -v -tags=e2e -count=1 ./test/e2e
 
 ## Multi-cluster resources
 
-The operator supports deploying Knative to remote spoke clusters via
-`spec.clusterProfileRef`. The following guides cover the feature end to end:
+The operator supports deploying Knative to remote spoke clusters via the Alpha
+`spec.placement` API. The following guides explain how to deploy Knative to a
+spoke cluster and run the multi-cluster E2E tests:
 
 - [Multi-cluster deployment guide](./multicluster.md)
 - [Multi-cluster E2E testing (local kind)](./development/e2e-multicluster.md)

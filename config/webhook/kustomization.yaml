@@ -16,3 +16,4 @@ resources:
 - webhook-service.yaml
 - webhook-secret.yaml
 - webhook.yaml
+- resource-validation.yaml

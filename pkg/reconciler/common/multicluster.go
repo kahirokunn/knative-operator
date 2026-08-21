@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ import (
 	mf "github.com/manifestival/manifestival"
 	"golang.org/x/sync/singleflight"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,8 +40,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 
 	"knative.dev/operator/pkg/apis/operator/base"
+	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
 
 	clusterinventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
@@ -51,6 +55,7 @@ const (
 	defaultRemoteClusterTimeout = 10 * time.Second
 	remoteClusterQPS            = float32(20)
 	remoteClusterBurst          = 40
+	remoteAnchorDeletionWait    = 2 * time.Second
 )
 
 var (
@@ -61,6 +66,13 @@ var (
 		"multi-cluster support is disabled: set --clusterprofile-provider-file to enable")
 
 	errClusterProviderClosed = errors.New("cluster provider closed during shutdown")
+	errClusterProfileChanged = errors.New("ClusterProfile changed while refreshing clients")
+
+	errProviderNotConfigured = errors.New(
+		"cluster provider not configured; set --clusterprofile-provider-file")
+	errAnchorDeletionPending = errors.New("anchor ConfigMap deletion pending")
+
+	knativeLeaderElectionLeaseSuffix = regexp.MustCompile(`[.-][0-9]{2,}-of-[0-9]{2,}$`)
 
 	globalProviderMu sync.Mutex
 	globalProvider   *ClusterProvider
@@ -142,6 +154,7 @@ func WithClientFactory(f ClientFactory) ProviderOption {
 type ClusterProvider struct {
 	mu            sync.RWMutex
 	entries       map[string]*clusterEntry
+	generations   map[string]uint64
 	access        ClusterProfileAccess
 	ciClient      clusterinventoryclient.Interface
 	controllerCtx context.Context
@@ -183,6 +196,7 @@ func NewClusterProvider(
 
 	p := &ClusterProvider{
 		entries:       make(map[string]*clusterEntry),
+		generations:   make(map[string]uint64),
 		access:        accessImpl,
 		ciClient:      ciClient,
 		controllerCtx: controllerCtx,
@@ -223,20 +237,25 @@ func (c *ClusterProvider) Refresh(ctx context.Context, namespace, name string) (
 	if c.closed.Load() {
 		return base.ReasonClusterProviderClosed, errClusterProviderClosed
 	}
-	key := namespace + "/" + name
+	key := clusterKey(namespace, name)
 	callerLogger := logging.FromContext(ctx)
 	v, err, _ := c.group.Do(key, func() (any, error) {
 		refreshCtx, cancel := context.WithTimeout(c.controllerCtx, c.remoteTimeout)
 		defer cancel()
 		refreshCtx = logging.WithLogger(refreshCtx, callerLogger)
-		reason, err := c.doRefresh(refreshCtx, key, namespace, name)
+		generation := c.generation(key)
+		reason, err := c.doRefresh(refreshCtx, key, namespace, name, generation)
 		return reason, err
 	})
 	reason, _ := v.(string)
 	return reason, err
 }
 
-func (c *ClusterProvider) doRefresh(ctx context.Context, key, namespace, name string) (string, error) {
+func (c *ClusterProvider) doRefresh(
+	ctx context.Context,
+	key, namespace, name string,
+	generation uint64,
+) (string, error) {
 	logger := logging.FromContext(ctx)
 
 	cp, err := c.ciClient.ApisV1alpha1().ClusterProfiles(namespace).Get(
@@ -304,9 +323,13 @@ func (c *ClusterProvider) doRefresh(ctx context.Context, key, namespace, name st
 	defer c.mu.Unlock()
 
 	if c.closed.Load() {
-		cancel()
 		newEntry.Close()
 		return base.ReasonClusterProviderClosed, errClusterProviderClosed
+	}
+	if c.generations[key] != generation {
+		newEntry.Close()
+		return base.ReasonClusterProfileUnavailable,
+			fmt.Errorf("%w: %s", errClusterProfileChanged, key)
 	}
 
 	if existing, ok := c.entries[key]; ok {
@@ -319,9 +342,28 @@ func (c *ClusterProvider) doRefresh(ctx context.Context, key, namespace, name st
 	return "", nil
 }
 
+func (c *ClusterProvider) generation(key string) uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.generations[key]
+}
+
 func (c *ClusterProvider) Remove(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.Close()
+		delete(c.entries, key)
+	}
+}
+
+func (c *ClusterProvider) invalidate(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.generations == nil {
+		c.generations = make(map[string]uint64)
+	}
+	c.generations[key]++
 	if entry, ok := c.entries[key]; ok {
 		entry.Close()
 		delete(c.entries, key)
@@ -380,7 +422,7 @@ func (c *ClusterProvider) GetOrRefresh(ctx context.Context, namespace, name stri
 	if c.closed.Load() {
 		return nil, base.ReasonClusterProviderClosed, errClusterProviderClosed
 	}
-	key := namespace + "/" + name
+	key := clusterKey(namespace, name)
 
 	if entry, _, err := c.Get(ctx, key); err == nil {
 		return entry, "", nil
@@ -390,6 +432,11 @@ func (c *ClusterProvider) GetOrRefresh(ctx context.Context, namespace, name stri
 		return nil, reason, err
 	}
 	return c.Get(ctx, key)
+}
+
+// clusterKey is the ClusterProvider cache key for a ClusterProfile.
+func clusterKey(namespace, name string) string {
+	return types.NamespacedName{Namespace: namespace, Name: name}.String()
 }
 
 // configEqual reports whether two rest.Configs have equivalent credentials.
@@ -419,13 +466,66 @@ func ShouldFinalizeClusterScoped(
 	components []base.KComponent,
 	original base.KComponent,
 ) bool {
+	originalRef := ClusterProfileRef(original)
 	for _, comp := range components {
 		if comp.GetDeletionTimestamp().IsZero() &&
-			SameClusterProfile(comp.GetSpec().GetClusterProfileRef(), original.GetSpec().GetClusterProfileRef()) {
+			SameClusterProfile(ClusterProfileRef(comp), originalRef) {
 			return false
 		}
 	}
 	return true
+}
+
+// EffectivePlacement returns the component's placement, translating the deprecated
+// clusterProfileRef field, which installs into the management CR namespace. The
+// legacy destination also wins for an invalid in-place migration so finalization
+// cannot target a location where the component was never installed.
+func EffectivePlacement(instance base.KComponent) *base.ComponentPlacement {
+	placement := instance.GetSpec().GetPlacement()
+	cpRef := instance.GetSpec().GetClusterProfileRef()
+	if cpRef != nil && (placement == nil || ValidatePlacement(instance) != nil) {
+		return &base.ComponentPlacement{
+			ClusterProfileRef: *cpRef,
+			Namespace:         instance.GetNamespace(),
+		}
+	}
+	return placement
+}
+
+// ClusterProfileRef returns the ClusterProfile selected by the effective placement.
+func ClusterProfileRef(instance base.KComponent) *base.ClusterProfileReference {
+	if placement := EffectivePlacement(instance); placement != nil {
+		ref := placement.ClusterProfileRef
+		return &ref
+	}
+	return nil
+}
+
+// InstallationNamespace returns the namespace selected by the effective placement.
+func InstallationNamespace(instance base.KComponent) string {
+	if placement := EffectivePlacement(instance); placement != nil {
+		return placement.Namespace
+	}
+	return instance.GetNamespace()
+}
+
+// ValidatePlacement verifies that spec.placement and the deprecated
+// spec.clusterProfileRef describe the same destination while both are set.
+func ValidatePlacement(instance base.KComponent) error {
+	cpRef := instance.GetSpec().GetClusterProfileRef()
+	placement := instance.GetSpec().GetPlacement()
+	if cpRef == nil || placement == nil {
+		return nil
+	}
+	if !SameClusterProfile(cpRef, &placement.ClusterProfileRef) {
+		return errors.New("spec.placement.clusterProfileRef must match deprecated spec.clusterProfileRef; " +
+			"correct spec.placement before completing the migration")
+	}
+	if placement.Namespace != instance.GetNamespace() {
+		return fmt.Errorf("spec.placement.namespace %q must match metadata.namespace %q while deprecated spec.clusterProfileRef is present; "+
+			"correct spec.placement before completing the migration", placement.Namespace, instance.GetNamespace())
+	}
+	return nil
 }
 
 func SameClusterProfile(a, b *base.ClusterProfileReference) bool {
@@ -447,8 +547,19 @@ func FinalizeRemoteCluster(
 ) error {
 	var errs []error
 
-	if err := DeleteAnchorConfigMap(ctx, clients.KubeClient(), instance); err != nil {
-		errs = append(errs, fmt.Errorf("anchor ConfigMap deletion: %w", err))
+	runtimeCleanupComplete := true
+	if err := deleteRemoteRuntimeResources(ctx, clients.KubeClient(), manifest, instance); err != nil {
+		runtimeCleanupComplete = false
+		errs = append(errs, fmt.Errorf("runtime resource deletion: %w", err))
+	}
+
+	// Runtime discovery can fall back to Deployments owned by the anchor when
+	// the installed manifest is unavailable. Keep that discovery root until
+	// runtime cleanup succeeds so a retry cannot orphan runtime resources.
+	if runtimeCleanupComplete {
+		if err := DeleteAnchorConfigMap(ctx, clients.KubeClient(), instance); err != nil {
+			errs = append(errs, fmt.Errorf("anchor ConfigMap deletion: %w", err))
+		}
 	}
 
 	if manifest != nil {
@@ -479,6 +590,20 @@ func FinalizeRemoteCluster(
 	return errors.Join(errs...)
 }
 
+// isOnlyAnchorDeletionPending reports whether foreground anchor deletion is the
+// single remaining cleanup failure.
+func isOnlyAnchorDeletionPending(err error) bool {
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		errs := wrapped.Unwrap()
+		return len(errs) == 1 && isOnlyAnchorDeletionPending(errs[0])
+	case interface{ Unwrap() error }:
+		return isOnlyAnchorDeletionPending(wrapped.Unwrap())
+	default:
+		return errors.Is(err, errAnchorDeletionPending)
+	}
+}
+
 // FinalizeRemoteClusterIfNeeded runs remote finalization if the instance targets a remote cluster.
 func FinalizeRemoteClusterIfNeeded(
 	ctx context.Context,
@@ -487,32 +612,172 @@ func FinalizeRemoteClusterIfNeeded(
 	instance base.KComponent,
 	optionalPreds ...mf.Predicate,
 ) (bool, error) {
-	cpRef := instance.GetSpec().GetClusterProfileRef()
+	cpRef := ClusterProfileRef(instance)
 	if cpRef == nil {
 		return false, nil
 	}
 	if provider == nil {
-		return true, fmt.Errorf("cluster provider not configured but clusterProfileRef is set")
+		return true, errProviderNotConfigured
 	}
 	logger := logging.FromContext(ctx)
-	clusterName := cpRef.Namespace + "/" + cpRef.Name
-	entry, reason, err := provider.Get(ctx, clusterName)
+	clusterName := clusterKey(cpRef.Namespace, cpRef.Name)
+	entry, reason, err := provider.GetOrRefresh(ctx, cpRef.Namespace, cpRef.Name)
 	if err != nil {
-		if errors.Is(err, errClusterNotResolved) {
-			logger.Warnf("ClusterProfile %s not yet resolved; remote resources may be orphaned. "+
-				"Remove finalizer manually if cluster is permanently gone.", clusterName)
-		} else if errors.Is(err, errClusterStale) {
-			logger.Warnf("ClusterProfile %s connection stale; remote resources may be orphaned. "+
-				"Will retry on next reconcile.", clusterName)
-		}
+		logger.Warnf("ClusterProfile %s unavailable during remote finalization; "+
+			"will retry on next reconcile: %v", clusterName, err)
 		instance.GetStatus().MarkTargetClusterNotResolved(
 			reason,
 			fmt.Sprintf("ClusterProfile %s unavailable: %v", clusterName, err))
 		return true, err
 	}
 	if err := FinalizeRemoteCluster(ctx, entry, manifest, instance, optionalPreds...); err != nil {
+		if isOnlyAnchorDeletionPending(err) {
+			return true, controller.NewRequeueAfter(remoteAnchorDeletionWait)
+		}
 		return true, fmt.Errorf("remote finalization: %w", err)
 	}
+	return true, nil
+}
+
+// AdoptRemoteRuntimeResources returns a Stage that makes the remote anchor own
+// runtime-created leader-election Leases and their same-name Services.
+func AdoptRemoteRuntimeResources(state *ReconcileState) Stage {
+	return func(ctx context.Context, manifest *mf.Manifest, instance base.KComponent) error {
+		if !state.IsRemote() || state.AnchorOwner == nil {
+			return nil
+		}
+		if err := adoptRemoteRuntimeResources(
+			ctx, state.RemoteClients.KubeClient(), manifest, instance, state.AnchorOwner); err != nil {
+			return fmt.Errorf("failed to adopt remote runtime resources: %w", err)
+		}
+		return nil
+	}
+}
+
+func adoptRemoteRuntimeResources(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	manifest *mf.Manifest,
+	instance base.KComponent,
+	anchor mf.Owner,
+) error {
+	if anchor.GetUID() == "" {
+		return errors.New("anchor ConfigMap has no UID")
+	}
+	names, err := remoteRuntimeResourceNames(ctx, kubeClient, manifest, instance)
+	if err != nil {
+		return err
+	}
+
+	namespace := InstallationNamespace(instance)
+	var errs []error
+	for _, name := range names {
+		if err := adoptRuntimeLease(ctx, kubeClient, anchor, namespace, name); err != nil {
+			errs = append(errs, err)
+		}
+		if err := adoptRuntimeService(ctx, kubeClient, anchor, namespace, name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func adoptRuntimeLease(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	anchor mf.Owner,
+	namespace, name string,
+) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		lease, err := kubeClient.CoordinationV1().Leases(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		changed, conflictingController := setAnchorControllerReference(lease, anchor)
+		if conflictingController != nil {
+			logging.FromContext(ctx).Warnf(
+				"Not adopting runtime Lease %s/%s: it is controlled by %s %s (UID %s)",
+				namespace, name, conflictingController.Kind, conflictingController.Name,
+				conflictingController.UID)
+			return nil
+		}
+		if !changed {
+			return nil
+		}
+		_, err = kubeClient.CoordinationV1().Leases(namespace).Update(
+			ctx, lease, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to adopt runtime Lease %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func adoptRuntimeService(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	anchor mf.Owner,
+	namespace, name string,
+) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		service, err := kubeClient.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		changed, conflictingController := setAnchorControllerReference(service, anchor)
+		if conflictingController != nil {
+			logging.FromContext(ctx).Warnf(
+				"Not adopting runtime Service %s/%s: it is controlled by %s %s (UID %s)",
+				namespace, name, conflictingController.Kind, conflictingController.Name,
+				conflictingController.UID)
+			return nil
+		}
+		if !changed {
+			return nil
+		}
+		_, err = kubeClient.CoreV1().Services(namespace).Update(ctx, service, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to adopt runtime Service %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func setAnchorControllerReference(object metav1.Object, anchor mf.Owner) (bool, *metav1.OwnerReference) {
+	if controller := metav1.GetControllerOfNoCopy(object); controller != nil {
+		if controller.UID == anchor.GetUID() {
+			return false, nil
+		}
+		return false, controller
+	}
+
+	controller := true
+	blockOwnerDeletion := true
+	desired := metav1.OwnerReference{
+		APIVersion:         corev1.SchemeGroupVersion.String(),
+		Kind:               "ConfigMap",
+		Name:               anchor.GetName(),
+		UID:                anchor.GetUID(),
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockOwnerDeletion,
+	}
+	ownerReferences := object.GetOwnerReferences()
+	for i := range ownerReferences {
+		if ownerReferences[i].UID == anchor.GetUID() {
+			ownerReferences[i] = desired
+			object.SetOwnerReferences(ownerReferences)
+			return true, nil
+		}
+	}
+	object.SetOwnerReferences(append(ownerReferences, desired))
 	return true, nil
 }
 
@@ -534,7 +799,7 @@ func EnsureAnchorConfigMap(
 	if len(name) > maxResourceNameLength {
 		return nil, fmt.Errorf("anchor ConfigMap name %q exceeds maximum length of %d characters; shorten the CR name", name, maxResourceNameLength)
 	}
-	ns := instance.GetNamespace()
+	ns := InstallationNamespace(instance)
 	nsCfg := instance.GetSpec().GetNamespaceConfiguration()
 
 	if _, err := kubeClient.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{}); err != nil {
@@ -564,7 +829,7 @@ func EnsureAnchorConfigMap(
 		}
 	} else if nsCfg != nil && (len(nsCfg.Labels) > 0 || len(nsCfg.Annotations) > 0) {
 		logger.Debugf("Namespace %s already exists on remote cluster; "+
-			"spec.namespaceConfiguration will be reconciled via the Install-stage transform.", ns)
+			"spec.namespace will be reconciled via the Install-stage transform.", ns)
 	}
 
 	expectedLabels := map[string]string{
@@ -640,17 +905,185 @@ func DeleteAnchorConfigMap(
 	instance base.KComponent,
 ) error {
 	name := AnchorName(instance)
-	ns := instance.GetNamespace()
-	err := kubeClient.CoreV1().ConfigMaps(ns).Delete(ctx, name, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
+	ns := InstallationNamespace(instance)
+	foreground := metav1.DeletePropagationForeground
+	err := kubeClient.CoreV1().ConfigMaps(ns).Delete(ctx, name, metav1.DeleteOptions{
+		PropagationPolicy: &foreground,
+	})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("failed to delete anchor ConfigMap %s/%s: %w", ns, name, err)
 	}
-	return nil
+
+	if _, err := kubeClient.CoreV1().ConfigMaps(ns).Get(ctx, name, metav1.GetOptions{}); apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to verify anchor ConfigMap deletion %s/%s: %w", ns, name, err)
+	}
+	return fmt.Errorf("%w: %s/%s", errAnchorDeletionPending, ns, name)
+}
+
+// deleteRemoteRuntimeResources removes the Leases, Services and EndpointSlices the Knative
+// controllers create at runtime. Explicit deletion is a fallback for resources that were
+// created before ownership adoption or whose garbage collection has not completed yet.
+func deleteRemoteRuntimeResources(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	manifest *mf.Manifest,
+	instance base.KComponent,
+) error {
+	names, err := remoteRuntimeResourceNames(ctx, kubeClient, manifest, instance)
+	if err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+
+	ns := InstallationNamespace(instance)
+	// A Service name can exceed the 63 character label value limit, so index client-side.
+	endpointSlices, err := kubeClient.DiscoveryV1().EndpointSlices(ns).List(ctx, metav1.ListOptions{
+		LabelSelector: discoveryv1.LabelServiceName,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list runtime EndpointSlices in namespace %s: %w", ns, err)
+	}
+	slicesByService := make(map[string][]string, len(names))
+	for i := range endpointSlices.Items {
+		service := endpointSlices.Items[i].Labels[discoveryv1.LabelServiceName]
+		slicesByService[service] = append(slicesByService[service], endpointSlices.Items[i].Name)
+	}
+
+	var errs []error
+	for _, name := range names {
+		incomplete := false
+		for _, sliceName := range slicesByService[name] {
+			if err := kubeClient.DiscoveryV1().EndpointSlices(ns).Delete(ctx, sliceName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				errs = append(errs, fmt.Errorf("failed to delete runtime EndpointSlice %s/%s: %w", ns, sliceName, err))
+				incomplete = true
+			}
+		}
+		if err := kubeClient.CoreV1().Services(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("failed to delete runtime Service %s/%s: %w", ns, name, err))
+			incomplete = true
+		}
+		// Keep the Lease until its resources are gone; it is what identifies them on retry.
+		if incomplete {
+			continue
+		}
+		if err := kubeClient.CoordinationV1().Leases(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("failed to delete runtime Lease %s/%s: %w", ns, name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// remoteRuntimeResourceNames returns the leader election Lease names held by this
+// installation's Deployments or owned by its anchor; the Service and its EndpointSlices
+// share the Lease name.
+func remoteRuntimeResourceNames(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	manifest *mf.Manifest,
+	instance base.KComponent,
+) ([]string, error) {
+	deployments, err := installedDeploymentNames(ctx, kubeClient, manifest, instance)
+	if err != nil {
+		return nil, err
+	}
+
+	ns := InstallationNamespace(instance)
+	anchor, err := kubeClient.CoreV1().ConfigMaps(ns).Get(
+		ctx, AnchorName(instance), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		anchor = nil
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get anchor ConfigMap %s/%s: %w", ns, AnchorName(instance), err)
+	}
+	if len(deployments) == 0 && anchor == nil {
+		return nil, nil
+	}
+
+	leases, err := kubeClient.CoordinationV1().Leases(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Leases in namespace %s: %w", ns, err)
+	}
+
+	names := make([]string, 0, len(leases.Items))
+	for i := range leases.Items {
+		lease := &leases.Items[i]
+		if anchor != nil && metav1.IsControlledBy(lease, anchor) {
+			names = append(names, lease.Name)
+			continue
+		}
+		if lease.Spec.HolderIdentity == nil {
+			continue
+		}
+		// A holder is "<pod name>_<suffix>", and a Deployment's Pods are "<deployment>-<rs>-<pod>".
+		holderPod, _, _ := strings.Cut(*lease.Spec.HolderIdentity, "_")
+		for _, deployment := range deployments {
+			if strings.HasPrefix(holderPod, deployment+"-") &&
+				(lease.Name == deployment || knativeLeaderElectionLeaseSuffix.MatchString(lease.Name)) {
+				names = append(names, lease.Name)
+				break
+			}
+		}
+	}
+	return names, nil
+}
+
+// installedDeploymentNames returns the Deployments this component installed, falling back
+// to the ones the anchor owns when the manifest is unavailable.
+func installedDeploymentNames(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	manifest *mf.Manifest,
+	instance base.KComponent,
+) ([]string, error) {
+	ns := InstallationNamespace(instance)
+	if manifest != nil {
+		var names []string
+		for _, resource := range manifest.Filter(mf.ByKind("Deployment")).Resources() {
+			if resource.GetNamespace() == ns {
+				names = append(names, resource.GetName())
+			}
+		}
+		if len(names) > 0 {
+			return names, nil
+		}
+	}
+
+	anchorName := AnchorName(instance)
+	anchor, err := kubeClient.CoreV1().ConfigMaps(ns).Get(ctx, anchorName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get anchor ConfigMap %s/%s: %w", ns, anchorName, err)
+	}
+	deployments, err := kubeClient.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Deployments in namespace %s: %w", ns, err)
+	}
+	var names []string
+	for i := range deployments.Items {
+		if metav1.IsControlledBy(&deployments.Items[i], anchor) {
+			names = append(names, deployments.Items[i].Name)
+		}
+	}
+	return names, nil
 }
 
 func ResolveTargetCluster(provider *ClusterProvider, state *ReconcileState) Stage {
 	return func(ctx context.Context, manifest *mf.Manifest, instance base.KComponent) error {
-		cpRef := instance.GetSpec().GetClusterProfileRef()
+		if err := ValidatePlacement(instance); err != nil {
+			instance.GetStatus().MarkTargetClusterNotResolved(base.ReasonInvalidPlacement, err.Error())
+			return err
+		}
+
+		cpRef := ClusterProfileRef(instance)
 		if cpRef == nil {
 			instance.GetStatus().MarkTargetClusterResolved()
 			return nil
@@ -658,9 +1091,8 @@ func ResolveTargetCluster(provider *ClusterProvider, state *ReconcileState) Stag
 
 		if provider == nil {
 			instance.GetStatus().MarkTargetClusterNotResolved(
-				base.ReasonAccessProviderNotConfigured,
-				"cluster provider not configured; set --clusterprofile-provider-file")
-			return fmt.Errorf("cluster provider not configured but clusterProfileRef is set")
+				base.ReasonAccessProviderNotConfigured, errProviderNotConfigured.Error())
+			return errProviderNotConfigured
 		}
 
 		entry, reason, err := provider.GetOrRefresh(ctx, cpRef.Namespace, cpRef.Name)

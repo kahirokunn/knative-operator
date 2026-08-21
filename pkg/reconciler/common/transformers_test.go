@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"knative.dev/operator/pkg/apis/operator/base"
 	"knative.dev/operator/pkg/apis/operator/v1beta1"
 	"knative.dev/pkg/ptr"
 )
@@ -225,24 +226,77 @@ func TestInjectOwner_SkipsClusterScoped(t *testing.T) {
 }
 
 func TestInjectNamespace(t *testing.T) {
-	component := &v1beta1.KnativeEventing{
+	tests := []struct {
+		name      string
+		component *v1beta1.KnativeEventing
+		want      string
+	}{{
+		name: "local install uses the CR namespace",
+		component: &v1beta1.KnativeEventing{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "test-name"},
+		},
+		want: "test-ns",
+	}, {
+		name: "remote install uses the placement namespace",
+		component: &v1beta1.KnativeEventing{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "fleet-workloads", Name: "eventing-spoke-tokyo"},
+			Spec: v1beta1.KnativeEventingSpec{CommonSpec: base.CommonSpec{
+				Placement: testPlacement("knative-eventing", testSpokeRef),
+			}},
+		},
+		want: "knative-eventing",
+	}, {
+		name: "deprecated clusterProfileRef uses the CR namespace",
+		component: &v1beta1.KnativeEventing{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "legacy-eventing-ns", Name: "knative-eventing"},
+			Spec: v1beta1.KnativeEventingSpec{CommonSpec: base.CommonSpec{
+				ClusterProfileRef: &testSpokeRef,
+			}},
+		},
+		want: "legacy-eventing-ns",
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := []unstructured.Unstructured{*NamespacedResource("test/v1", "TestCR", "another-ns", "test-resource")}
+			manifest, err := mf.ManifestFrom(mf.Slice(in))
+			if err != nil {
+				t.Fatalf("Failed to generate manifest: %v", err)
+			}
+			if err := InjectNamespace(&manifest, tt.component); err != nil {
+				t.Fatalf("Failed to transform manifest: %v", err)
+			}
+			if got := manifest.Resources()[0].GetNamespace(); got != tt.want {
+				t.Fatalf("GetNamespace() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTransform_RenamesNamespaceToPlacementNamespace(t *testing.T) {
+	component := &v1beta1.KnativeServing{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      "test-name",
+			Namespace: "fleet-workloads",
+			Name:      "serving-spoke-tokyo",
+		},
+		Spec: v1beta1.KnativeServingSpec{
+			CommonSpec: base.CommonSpec{
+				Placement: testPlacement("custom-serving-system", base.ClusterProfileReference{
+					Namespace: "fleet-system",
+					Name:      "spoke-tokyo",
+				}),
+			},
 		},
 	}
-	in := []unstructured.Unstructured{*NamespacedResource("test/v1", "TestCR", "another-ns", "test-resource")}
-	manifest, err := mf.ManifestFrom(mf.Slice(in))
+	manifest, err := mf.ManifestFrom(mf.Slice{*ClusterScopedResource("v1", "Namespace", "knative-serving")})
 	if err != nil {
 		t.Fatalf("Failed to generate manifest: %v", err)
 	}
-	if err := InjectNamespace(&manifest, component); err != nil {
+	if err := Transform(context.Background(), &manifest, component); err != nil {
 		t.Fatalf("Failed to transform manifest: %v", err)
 	}
-	resource := &manifest.Resources()[0]
 
-	// Verify namespace is carried over.
-	if got, want := resource.GetNamespace(), component.GetNamespace(); got != want {
-		t.Fatalf("GetNamespace() = %s, want %s", got, want)
+	if got, want := manifest.Resources()[0].GetName(), "custom-serving-system"; got != want {
+		t.Fatalf("Namespace name = %q, want placement namespace %q", got, want)
 	}
 }

@@ -137,6 +137,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, ks *v1beta1.KnativeServi
 		common.CheckWebhookDeployment, // Wait for webhook to be ready before creating Certificate resources
 		common.InstallWebhookDependentResources,
 		common.CheckDeployments,
+		common.AdoptRemoteRuntimeResources(&state),
 		common.MarkStatusSuccess,
 		common.DeleteObsoleteResources(ctx, ks, r.installed),
 	}

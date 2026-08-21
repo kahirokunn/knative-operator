@@ -22,13 +22,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"knative.dev/operator/pkg/apis/operator"
 	operatorv1beta1 "knative.dev/operator/pkg/apis/operator/v1beta1"
+	operatorclient "knative.dev/operator/pkg/client/injection/client"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/injection/sharedmain"
 	"knative.dev/pkg/signals"
 	"knative.dev/pkg/webhook"
 	"knative.dev/pkg/webhook/certificates"
+	"knative.dev/pkg/webhook/resourcesemantics"
 	"knative.dev/pkg/webhook/resourcesemantics/conversion"
+	"knative.dev/pkg/webhook/resourcesemantics/validation"
 )
 
 func main() {
@@ -42,6 +45,22 @@ func main() {
 	sharedmain.WebhookMainWithContext(ctx, webhook.NameFromEnv(),
 		certificates.NewController,
 		newConversionController,
+		newValidationController,
+	)
+}
+
+func newValidationController(ctx context.Context, _ configmap.Watcher) *controller.Impl {
+	callbacks := placementValidationCallbacks(operatorclient.Get(ctx))
+	return validation.NewAdmissionController(ctx,
+		"validation.webhook.operator.knative.dev",
+		"/resource-validation",
+		map[schema.GroupVersionKind]resourcesemantics.GenericCRD{
+			operatorv1beta1.SchemeGroupVersion.WithKind("KnativeServing"):  &operatorv1beta1.KnativeServing{},
+			operatorv1beta1.SchemeGroupVersion.WithKind("KnativeEventing"): &operatorv1beta1.KnativeEventing{},
+		},
+		func(ctx context.Context) context.Context { return ctx },
+		false,
+		callbacks,
 	)
 }
 

@@ -82,7 +82,10 @@ type KComponentSpec interface {
 	// GetPodDisruptionBudgetOverride gets the PodDisruptionBudget configurations to override.
 	GetPodDisruptionBudgetOverride() []PodDisruptionBudgetOverride
 
-	// GetClusterProfileRef gets the reference to a ClusterProfile for multi-cluster deployment.
+	// GetPlacement gets the remote cluster and installation namespace.
+	GetPlacement() *ComponentPlacement
+
+	// GetClusterProfileRef gets the deprecated top-level clusterProfileRef field.
 	GetClusterProfileRef() *ClusterProfileReference
 }
 
@@ -187,8 +190,15 @@ type CommonSpec struct {
 	// +optional
 	PodDisruptionBudgetOverride []PodDisruptionBudgetOverride `json:"podDisruptionBudgets,omitempty"`
 
-	// ClusterProfileRef optionally targets a ClusterProfile; when set, the
-	// component is reconciled on the referenced remote cluster.
+	// Placement selects a remote cluster and the namespace where Knative is installed.
+	// This field is Alpha and may change without backward compatibility.
+	// +optional
+	Placement *ComponentPlacement `json:"placement,omitempty"`
+
+	// ClusterProfileRef selects a remote cluster. When Placement is not set, the
+	// component is installed in the management CR's namespace on that cluster.
+	//
+	// Deprecated: use Placement to select both the remote cluster and installation namespace.
 	// +optional
 	ClusterProfileRef *ClusterProfileReference `json:"clusterProfileRef,omitempty"`
 }
@@ -246,6 +256,11 @@ func (c *CommonSpec) GetServiceOverride() []ServiceOverride {
 // GetPodDisruptionBudgetOverride implements KComponentSpec.
 func (c *CommonSpec) GetPodDisruptionBudgetOverride() []PodDisruptionBudgetOverride {
 	return c.PodDisruptionBudgetOverride
+}
+
+// GetPlacement implements KComponentSpec.
+func (c *CommonSpec) GetPlacement() *ComponentPlacement {
+	return c.Placement
 }
 
 // GetClusterProfileRef implements KComponentSpec.
@@ -466,8 +481,25 @@ type CustomCerts struct {
 type ClusterProfileReference struct {
 	// Name is the name of the ClusterProfile resource.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Name string `json:"name"`
 	// Namespace is the namespace of the ClusterProfile resource.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace string `json:"namespace"`
+}
+
+// ComponentPlacement identifies where a Knative component is installed on a remote cluster.
+// This API is Alpha and may change without backward compatibility.
+type ComponentPlacement struct {
+	// ClusterProfileRef identifies the ClusterProfile resource for the remote cluster.
+	ClusterProfileRef ClusterProfileReference `json:"clusterProfileRef"`
+
+	// Namespace is the namespace on the remote cluster where Knative is installed.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Namespace string `json:"namespace"`
 }

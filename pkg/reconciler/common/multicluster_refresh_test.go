@@ -240,6 +240,107 @@ func TestNotifyListeners_DoesNotCallRefresh(t *testing.T) {
 	}
 }
 
+func TestClusterProvider_HandleUpdate_InvalidatesClientBeforeNotification(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*clusterinventoryv1alpha1.ClusterProfile)
+	}{
+		{
+			name: "access provider changed",
+			mutate: func(cp *clusterinventoryv1alpha1.ClusterProfile) {
+				cp.Status.AccessProviders = []clusterinventoryv1alpha1.AccessProvider{{Name: "secretreader"}}
+			},
+		},
+		{
+			name: "deprecated credential provider changed",
+			mutate: func(cp *clusterinventoryv1alpha1.ClusterProfile) {
+				cp.Status.CredentialProviders = []clusterinventoryv1alpha1.CredentialProvider{{Name: "legacy"}}
+			},
+		},
+		{
+			name: "cluster became not ready",
+			mutate: func(cp *clusterinventoryv1alpha1.ClusterProfile) {
+				cp.Status.Conditions[0].Status = metav1.ConditionFalse
+				cp.Status.Conditions[0].Reason = "ControlPlaneUnhealthy"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := newTestProviderWithStubAccess(&stubAccess{})
+			entry := newTestClusterEntry("https://old.example.com")
+			provider.entries["fleet/worker"] = entry
+
+			var cachePresentDuringNotification bool
+			provider.RegisterListener(ClusterProfileListener{
+				ListCRs: func(namespace, name string) []types.NamespacedName {
+					if namespace != "fleet" || name != "worker" {
+						t.Fatalf("listener key = %s/%s, want fleet/worker", namespace, name)
+					}
+					_, _, err := provider.Get(context.Background(), "fleet/worker")
+					cachePresentDuringNotification = err == nil
+					return nil
+				},
+				EnqueueKey: func(types.NamespacedName) {},
+			})
+
+			oldCP := readyClusterProfile("fleet", "worker")
+			oldCP.ResourceVersion = "1"
+			newCP := oldCP.DeepCopy()
+			newCP.ResourceVersion = "2"
+			tt.mutate(newCP)
+			provider.handleUpdate(oldCP, newCP)
+
+			if cachePresentDuringNotification {
+				t.Fatal("cached clients were still present when listeners were notified")
+			}
+			if entry.IsAlive() {
+				t.Fatal("invalidated cache entry is still alive")
+			}
+		})
+	}
+}
+
+func TestClusterProvider_HandleUpdate_NonConnectivityChangesKeepCachedClients(t *testing.T) {
+	provider := newTestProviderWithStubAccess(&stubAccess{})
+	entry := newTestClusterEntry("https://cached.example.com")
+	provider.entries["fleet/worker"] = entry
+
+	oldCP := readyClusterProfile("fleet", "worker")
+	oldCP.ResourceVersion = "1"
+	newCP := oldCP.DeepCopy()
+	newCP.ResourceVersion = "2"
+	newCP.Status.Conditions[0].Message = "heartbeat updated"
+	newCP.Status.Version.Kubernetes = "v1.35.0"
+	newCP.Status.Properties = []clusterinventoryv1alpha1.Property{{Name: "region", Value: "tokyo"}}
+
+	var notified bool
+	provider.RegisterListener(ClusterProfileListener{
+		ListCRs: func(namespace, name string) []types.NamespacedName {
+			notified = namespace == "fleet" && name == "worker"
+			return nil
+		},
+		EnqueueKey: func(types.NamespacedName) {},
+	})
+
+	provider.handleUpdate(oldCP, newCP)
+
+	got, _, err := provider.Get(context.Background(), "fleet/worker")
+	if err != nil {
+		t.Fatalf("Get() after non-connectivity update = %v, want cached clients", err)
+	}
+	if got.RestConfig().Host != "https://cached.example.com" {
+		t.Fatalf("cached Host = %q, want https://cached.example.com", got.RestConfig().Host)
+	}
+	if !entry.IsAlive() {
+		t.Fatal("non-connectivity update closed the cached entry")
+	}
+	if !notified {
+		t.Fatal("listeners were not notified")
+	}
+}
+
 func assertTargetClusterNotResolved(t *testing.T, status *v1beta1.KnativeServingStatus, wantReason, wantMsgContains string) {
 	t.Helper()
 	tc := status.GetCondition(base.TargetClusterResolved)
@@ -264,10 +365,10 @@ func TestResolveTargetCluster_ReasonPropagation(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "knative-serving", Name: "default"},
 			Spec: v1beta1.KnativeServingSpec{
 				CommonSpec: base.CommonSpec{
-					ClusterProfileRef: &base.ClusterProfileReference{
+					Placement: testPlacement("knative-serving", base.ClusterProfileReference{
 						Namespace: "fleet",
 						Name:      "worker",
-					},
+					}),
 				},
 			},
 		}
@@ -292,6 +393,18 @@ func TestResolveTargetCluster_ReasonPropagation(t *testing.T) {
 		runResolve(t, nil, inst)
 		assertTargetClusterNotResolved(t, &inst.Status,
 			base.ReasonAccessProviderNotConfigured, "cluster provider not configured")
+	})
+
+	t.Run("InvalidPlacement", func(t *testing.T) {
+		ref := base.ClusterProfileReference{Namespace: "fleet", Name: "worker"}
+		inst := newInstance()
+		inst.Spec.CommonSpec = base.CommonSpec{
+			ClusterProfileRef: &ref,
+			Placement:         testPlacement("custom-serving", ref),
+		}
+		runResolve(t, nil, inst)
+		assertTargetClusterNotResolved(t, &inst.Status,
+			base.ReasonInvalidPlacement, "must match metadata.namespace")
 	})
 
 	t.Run("Disabled", func(t *testing.T) {

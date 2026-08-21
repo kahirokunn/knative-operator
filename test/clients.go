@@ -27,14 +27,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"knative.dev/operator/pkg/client/clientset/versioned"
 	operatorv1beta1 "knative.dev/operator/pkg/client/clientset/versioned/typed/operator/v1beta1"
+	clusterinventoryclient "sigs.k8s.io/cluster-inventory-api/client/clientset/versioned"
 )
 
 // Clients holds instances of interfaces for making requests to Knative Serving.
 type Clients struct {
-	KubeClient kubernetes.Interface
-	Dynamic    dynamic.Interface
-	Operator   operatorv1beta1.OperatorV1beta1Interface
-	Config     *rest.Config
+	KubeClient       kubernetes.Interface
+	Dynamic          dynamic.Interface
+	Operator         operatorv1beta1.OperatorV1beta1Interface
+	ClusterInventory clusterinventoryclient.Interface
+	Config           *rest.Config
 }
 
 // NewClients instantiates and returns several clientsets required for making request to the
@@ -61,6 +63,11 @@ func NewClients(configPath string, clusterName string) (*Clients, error) {
 	}
 
 	clients.Operator, err = newKnativeOperatorBetaClients(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	clients.ClusterInventory, err = clusterinventoryclient.NewForConfig(cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -70,13 +71,7 @@ func (c *ClusterProvider) StartInformer(ctx context.Context) {
 				}
 				c.notifyListeners(cp.Namespace, cp.Name)
 			},
-			UpdateFunc: func(_, newObj any) {
-				cp, ok := newObj.(*clusterinventoryv1alpha1.ClusterProfile)
-				if !ok {
-					return
-				}
-				c.notifyListeners(cp.Namespace, cp.Name)
-			},
+			UpdateFunc: c.handleUpdate,
 			DeleteFunc: c.handleDelete,
 		},
 	})
@@ -92,6 +87,25 @@ func (c *ClusterProvider) StartInformer(ctx context.Context) {
 	}
 }
 
+func (c *ClusterProvider) handleUpdate(oldObj, newObj any) {
+	cp, ok := newObj.(*clusterinventoryv1alpha1.ClusterProfile)
+	if !ok {
+		return
+	}
+	old, ok := oldObj.(*clusterinventoryv1alpha1.ClusterProfile)
+	if !ok || clusterProfileClientInvalidated(old, cp) {
+		c.invalidateAndNotify(cp.Namespace, cp.Name)
+		return
+	}
+	c.notifyListeners(cp.Namespace, cp.Name)
+}
+
+func clusterProfileClientInvalidated(old, current *clusterinventoryv1alpha1.ClusterProfile) bool {
+	return !isClusterProfileReady(current) ||
+		!apiequality.Semantic.DeepEqual(old.Status.AccessProviders, current.Status.AccessProviders) ||
+		!apiequality.Semantic.DeepEqual(old.Status.CredentialProviders, current.Status.CredentialProviders)
+}
+
 func (c *ClusterProvider) handleDelete(obj any) {
 	cp, ok := obj.(*clusterinventoryv1alpha1.ClusterProfile)
 	if !ok {
@@ -104,6 +118,12 @@ func (c *ClusterProvider) handleDelete(obj any) {
 			return
 		}
 	}
-	c.Remove(cp.Namespace + "/" + cp.Name)
-	c.notifyListeners(cp.Namespace, cp.Name)
+	c.invalidateAndNotify(cp.Namespace, cp.Name)
+}
+
+// invalidateAndNotify drops the cached clients before waking the CRs that target them, so a
+// reconcile triggered by the notification never observes the stale connection.
+func (c *ClusterProvider) invalidateAndNotify(namespace, name string) {
+	c.invalidate(clusterKey(namespace, name))
+	c.notifyListeners(namespace, name)
 }

@@ -115,3 +115,8 @@ rules:
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+
+  # Reject multiple installations of the same component on one remote cluster.
+  - apiGroups: ["operator.knative.dev"]
+    resources: ["knativeservings", "knativeeventings"]
+    verbs: ["list"]

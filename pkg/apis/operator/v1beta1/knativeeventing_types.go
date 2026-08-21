@@ -33,7 +33,9 @@ var (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Target Cluster",type=string,JSONPath=`.spec.clusterProfileRef.name`,priority=0
+// +kubebuilder:printcolumn:name="Target Cluster",type=string,JSONPath=`.spec.placement.clusterProfileRef.name`,priority=0
+// +kubebuilder:printcolumn:name="Target Namespace",type=string,JSONPath=`.spec.placement.namespace`,priority=0
+// +kubebuilder:printcolumn:name="Legacy Target Cluster",type=string,JSONPath=`.spec.clusterProfileRef.name`,priority=1
 type KnativeEventing struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -53,8 +55,15 @@ func (ke *KnativeEventing) GetStatus() base.KComponentStatus {
 }
 
 // KnativeEventingSpec defines the desired state of KnativeEventing
-// +kubebuilder:validation:XValidation:rule="has(self.clusterProfileRef) == has(oldSelf.clusterProfileRef)",message="spec.clusterProfileRef cannot be added or removed after creation"
-// +kubebuilder:validation:XValidation:rule="!has(self.clusterProfileRef) || !has(oldSelf.clusterProfileRef) || self.clusterProfileRef == oldSelf.clusterProfileRef",message="spec.clusterProfileRef is immutable"
+// Migration from clusterProfileRef to placement is intentionally staged: first add a matching
+// placement while retaining clusterProfileRef, then remove clusterProfileRef in a later update.
+// Single-step swaps are rejected; placement remains correctable while the legacy field exists
+// and becomes immutable after it is removed. Neither remote field can otherwise be introduced
+// after creation.
+// +kubebuilder:validation:XValidation:rule="(has(self.clusterProfileRef) || has(self.placement)) == (has(oldSelf.clusterProfileRef) || has(oldSelf.placement))",message="remote placement cannot be added or removed after creation"
+// +kubebuilder:validation:XValidation:rule="!has(self.clusterProfileRef) || (has(oldSelf.clusterProfileRef) && self.clusterProfileRef == oldSelf.clusterProfileRef)",message="spec.clusterProfileRef is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.placement) || (has(self.placement) && (self.placement == oldSelf.placement || has(self.clusterProfileRef)))",message="spec.placement is immutable once spec.clusterProfileRef is removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.clusterProfileRef) || has(self.clusterProfileRef) || (has(oldSelf.placement) && has(self.placement) && [self.placement.clusterProfileRef.name, self.placement.clusterProfileRef.namespace] == [oldSelf.clusterProfileRef.name, oldSelf.clusterProfileRef.namespace])",message="spec.clusterProfileRef cannot be removed until spec.placement targets the same ClusterProfile in a prior update"
 type KnativeEventingSpec struct {
 	base.CommonSpec `json:",inline"`
 
