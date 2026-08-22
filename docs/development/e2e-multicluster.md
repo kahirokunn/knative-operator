@@ -115,9 +115,11 @@ metadata:
   name: knative-serving
   namespace: knative-serving
 spec:
-  clusterProfileRef:
-    name: spoke
-    namespace: default
+  destination:
+    clusterProfileRef:
+      name: spoke
+      namespace: default
+    namespace: knative-serving
 EOF
 kubectl apply -f /tmp/knativeserving-spoke.yaml
 ```
@@ -133,9 +135,11 @@ metadata:
   name: knative-eventing
   namespace: knative-eventing
 spec:
-  clusterProfileRef:
-    name: spoke
-    namespace: default
+  destination:
+    clusterProfileRef:
+      name: spoke
+      namespace: default
+    namespace: knative-eventing-spoke
 EOF
 kubectl apply -f /tmp/knativeeventing-spoke.yaml
 ```
