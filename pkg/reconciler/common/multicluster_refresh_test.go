@@ -264,9 +264,12 @@ func TestResolveTargetCluster_ReasonPropagation(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "knative-serving", Name: "default"},
 			Spec: v1beta1.KnativeServingSpec{
 				CommonSpec: base.CommonSpec{
-					ClusterProfileRef: &base.ClusterProfileReference{
-						Namespace: "fleet",
-						Name:      "worker",
+					Destination: &base.ComponentDestination{
+						ClusterProfileRef: base.ClusterProfileReference{
+							Namespace: "fleet",
+							Name:      "worker",
+						},
+						Namespace: "knative-serving",
 					},
 				},
 			},
