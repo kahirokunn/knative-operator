@@ -29,7 +29,7 @@ require (
 	knative.dev/pkg v0.0.0-20260825072334-d2a153acc00c
 	knative.dev/reconciler-test v0.0.0-20260821021027-c844fc2204aa
 	knative.dev/serving v0.50.1-0.20260825144834-618b0c275af1
-	sigs.k8s.io/cluster-inventory-api v0.1.3
+	sigs.k8s.io/cluster-inventory-api v0.2.0
 	sigs.k8s.io/controller-tools v0.20.1
 	sigs.k8s.io/yaml v1.6.0
 )
